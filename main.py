@@ -38,47 +38,57 @@ def unzip_file(zip_path, extract_to):
         zip_ref.extractall(extract_to)
     print(f"Extracted {zip_path} to {extract_to}")
 
-def setup_chrome_and_driver():
-    if not os.path.isfile(chrome_headless_path) or not os.path.isfile(chrome_driver_path):
-        if not os.path.isfile(chrome_headless_zip_path):
-            download_file(chrome_headless_url, chrome_headless_zip_path)
-        if not os.path.isfile(chrome_driver_zip_path):
-            download_file(chrome_driver_url, chrome_driver_zip_path)
+# Check if Chrome Headless Shell and ChromeDriver are already available
+if not os.path.isfile(chrome_headless_path) or not os.path.isfile(chrome_driver_path):
+    # Download Chrome Headless Shell and ChromeDriver if not already present
+    if not os.path.isfile(chrome_headless_zip_path):
+        download_file(chrome_headless_url, chrome_headless_zip_path)
+    if not os.path.isfile(chrome_driver_zip_path):
+        download_file(chrome_driver_url, chrome_driver_zip_path)
 
-        if not os.path.isfile(chrome_headless_path):
-            unzip_file(chrome_headless_zip_path, "chrome-headless-shell-linux64")
-        if not os.path.isfile(chrome_driver_path):
-            unzip_file(chrome_driver_zip_path, "chromedriver-linux64")
+    # Unzip the downloaded files
+    if not os.path.isfile(chrome_headless_path):
+        unzip_file(chrome_headless_zip_path, "chrome-headless-shell-linux64")
+    if not os.path.isfile(chrome_driver_path):
+        unzip_file(chrome_driver_zip_path, "chromedriver-linux64")
 
-        subprocess.run(["chmod", "+x", chrome_headless_path])
-        subprocess.run(["chmod", "+x", chrome_driver_path])
-    else:
-        print("Chrome Headless Shell and ChromeDriver are already available.")
+    # Set executable permissions
+    subprocess.run(["chmod", "+x", chrome_headless_path])
+    subprocess.run(["chmod", "+x", chrome_driver_path])
+else:
+    print("Chrome Headless Shell and ChromeDriver are already available.")
 
-@app.route('/scrape', methods=['GET'])
-def scrape_page():
-    setup_chrome_and_driver()
+# Set Chrome options
+chrome_options = Options()
+chrome_options.binary_location = chrome_headless_path
+chrome_options.add_argument('--headless')
+chrome_options.add_argument('--no-sandbox')
+chrome_options.add_argument('--disable-dev-shm-usage')
+chrome_options.add_argument('--disable-gpu')
 
-    url = request.args.get('url')
-    chrome_options = Options()
-    chrome_options.binary_location = chrome_headless_path
-    chrome_options.add_argument('--headless')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
+# Initialize Chrome webdriver
+service = Service(chrome_driver_path)
+driver = webdriver.Chrome(service=service, options=chrome_options)
 
-    service = Service(chrome_driver_path)
-    driver = webdriver.Chrome(service=service, options=chrome_options)
+@app.route('/get_page_source', methods=['GET'])
+def get_page_source():
+    url = request.args.get('url', 'https://epaper.eenadu.net/Home/Index?date=04/08/2024&eid=1')
+    driver.get(url)
 
     try:
-        driver.get(url)
+        # Wait for 10 seconds to ensure the page loads completely
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+        # Get the page source (HTML content)
         page_source = driver.page_source
-        return jsonify({"page_source": page_source})
+
+        return jsonify({'page_source': page_source})
+
     except TimeoutException:
-        return jsonify({"error": "Timeout occurred while waiting for the page to load."}), 504
+        return jsonify({'error': 'Timeout occurred while waiting for the page to load.'}), 500
     finally:
+        # Close the browser
         driver.quit()
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0')
+    app.run(host='0.0.0.0', port=3080)  # Render expects the app to be available on port 8080
