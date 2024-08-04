@@ -6,8 +6,8 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && \
+    apt-get install -y wget unzip && \
     apt-get install -y \
-    wget \
     libnss3 \
     libnss3-dev \
     libnspr4 \
@@ -43,15 +43,15 @@ RUN apt-get update && \
     libwayland-server0 \
     libxau6 \
     libxdmcp6 \
-    librt0 \
+    librt1 \
     liblzma5 \
     liblz4-1 \
     libgcrypt20 \
     libblkid1 \
     libpcre2-8-0 \
     libbsd0 \
-    libgpg-error0 \
-    && rm -rf /var/lib/apt/lists/*
+    libgpg-error0 || true && \
+    rm -rf /var/lib/apt/lists/*
 
 # Download and install chromedriver
 RUN wget https://chromedriver.storage.googleapis.com/114.0.5735.90/chromedriver_linux64.zip -O /chromedriver.zip \
@@ -64,11 +64,8 @@ COPY . /app
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Make port available to the world outside this container
+# Make port 80 available to the world outside this container
 EXPOSE 3080
-
-# Define environment variable
-ENV NAME World
 
 # Run main.py when the container launches
 CMD ["python", "main.py"]
