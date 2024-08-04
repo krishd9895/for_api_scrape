@@ -1,5 +1,8 @@
 #!/bin/bash
 
+apt-get update
+apt-get install sudo
+
 # Update the package list
 sudo apt-get update
 
