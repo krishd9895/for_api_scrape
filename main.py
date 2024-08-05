@@ -1,15 +1,13 @@
-from flask import Flask, request, jsonify
 import os
 import requests
 import zipfile
 import subprocess
+import time
+from flask import Flask, request, jsonify
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
@@ -58,37 +56,48 @@ if not os.path.isfile(chrome_headless_path) or not os.path.isfile(chrome_driver_
 else:
     print("Chrome Headless Shell and ChromeDriver are already available.")
 
-# Set Chrome options
-chrome_options = Options()
-chrome_options.binary_location = chrome_headless_path
-chrome_options.add_argument('--headless')
-chrome_options.add_argument('--no-sandbox')
-chrome_options.add_argument('--disable-dev-shm-usage')
-chrome_options.add_argument('--disable-gpu')
+def get_page_source(url):
+    # Set up Chrome options
+    chrome_options = Options()
+    chrome_options.binary_location = chrome_headless_path
+    chrome_options.add_argument("--headless")  # Run Chrome in headless mode
+    chrome_options.add_argument("--no-sandbox")  # Required for some environments
+    chrome_options.add_argument("--disable-dev-shm-usage")  # Required for some environments
 
-# Initialize Chrome webdriver
-service = Service(chrome_driver_path)
-driver = webdriver.Chrome(service=service, options=chrome_options)
+    # Set up ChromeDriver service
+    service = Service(executable_path=chrome_driver_path)
 
-@app.route('/get_page_source', methods=['GET'])
-def get_page_source():
-    url = request.args.get('url', 'https://epaper.eenadu.net/Home/Index?date=04/08/2024&eid=1')
-    driver.get(url)
+    # Initialize Chrome webdriver with options
+    driver = webdriver.Chrome(service=service, options=chrome_options)
 
     try:
-        # Wait for 10 seconds to ensure the page loads completely
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        # Open the URL
+        driver.get(url)
 
-        # Get the page source (HTML content)
+        # Wait for 2 seconds
+        time.sleep(2)
+
+        # Get the HTML source of the page
         page_source = driver.page_source
 
-        return jsonify({'page_source': page_source})
+        # Prettify the HTML source using BeautifulSoup
+        soup = BeautifulSoup(page_source, 'html.parser')
+        pretty_html = soup.prettify()
 
-    except TimeoutException:
-        return jsonify({'error': 'Timeout occurred while waiting for the page to load.'}), 500
+        return pretty_html
     finally:
-        # Close the browser
+        # Quit the driver
         driver.quit()
 
+@app.route('/scrape', methods=['POST'])
+def scrape():
+    data = request.json
+    url = data.get('url')
+    if not url:
+        return jsonify({"error": "URL is required"}), 400
+
+    pretty_html = get_page_source(url)
+    return jsonify({"page_source": pretty_html})
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=3080)  # Render expects the app to be available on port 8080
+    app.run(host='0.0.0.0', port=3090)
