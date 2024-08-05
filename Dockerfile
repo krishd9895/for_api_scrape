@@ -33,7 +33,7 @@ RUN wget -O chrome-headless-shell-linux64.zip https://storage.googleapis.com/chr
 # Download and extract ChromeDriver
 RUN wget -O chromedriver-linux64.zip https://storage.googleapis.com/chrome-for-testing-public/126.0.6478.182/linux64/chromedriver-linux64.zip && \
     unzip chromedriver-linux64.zip -d /app && \
-    chmod +x /app/chromedriver-linux64/chromedriver-linux64/chromedriver
+    chmod +x /app/chromedriver-linux64/chromedriver
 
 # Copy the current directory contents into the container at /app
 COPY . /app
