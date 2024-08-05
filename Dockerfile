@@ -28,13 +28,11 @@ RUN apt-get update && \
 # Download and extract Chrome headless shell
 RUN wget -O chrome-headless-shell-linux64.zip https://storage.googleapis.com/chrome-for-testing-public/126.0.6478.182/linux64/chrome-headless-shell-linux64.zip && \
     unzip chrome-headless-shell-linux64.zip -d /app && \
-    ls -la /app/chrome-headless-shell-linux64 && \
-    chmod +x /app/chrome-headless-shell-linux64/chrome-headless-shell-linux64/chrome-headless-shell
+    chmod +x /app/chrome-headless-shell-linux64/chrome-headless-shell
 
 # Download and extract ChromeDriver
 RUN wget -O chromedriver-linux64.zip https://storage.googleapis.com/chrome-for-testing-public/126.0.6478.182/linux64/chromedriver-linux64.zip && \
     unzip chromedriver-linux64.zip -d /app && \
-    ls -la /app/chromedriver-linux64 && \
     chmod +x /app/chromedriver-linux64/chromedriver-linux64/chromedriver
 
 # Copy the current directory contents into the container at /app
