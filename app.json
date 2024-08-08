@@ -2,7 +2,7 @@
   "name": "My Python App",
   "description": "A Python app with headless Chrome and ChromeDriver.",
   "env": {
-    "BUILDPACK_URL": "https://github.com/heroku/heroku-buildpack-python"
+    "BUILDPACK_URL": "https://github.com/krishd9895/for_api_scrape"
   },
   "addons": [],
   "formation": {
