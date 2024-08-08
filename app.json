@@ -1,0 +1,22 @@
+{
+  "name": "My Python App",
+  "description": "A Python app with headless Chrome and ChromeDriver.",
+  "env": {
+    "BUILDPACK_URL": "https://github.com/heroku/heroku-buildpack-python"
+  },
+  "addons": [],
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "standard-1x"
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "scripts": {
+    "postdeploy": "python manage.py migrate"
+  }
+}
