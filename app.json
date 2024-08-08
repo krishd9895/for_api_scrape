@@ -11,12 +11,8 @@
       "size": "standard-1x"
     }
   },
-  "buildpacks": [
-    {
-      "url": "heroku/python"
-    }
-  ],
   "scripts": {
     "postdeploy": "python manage.py migrate"
-  }
+  },
+  "stack": "container"
 }
