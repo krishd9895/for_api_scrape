@@ -3,3 +3,4 @@ pyTelegramBotAPI
 schedule
 Flask
 PySocks
+pymongo
