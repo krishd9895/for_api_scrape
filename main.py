@@ -71,21 +71,21 @@ def replace_last_checking_log(message):
     try:
         timestamp = datetime.now(INDIAN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S IST")
         new_log_line = f"{timestamp} - INFO - {message}\n"
-        
+
         # Read all existing logs
         if os.path.exists(LOG_FILE):
             with open(LOG_FILE, "r", encoding='utf-8') as f:
                 lines = f.readlines()
-            
+
             # Remove the last "Checking Indian time" log if it exists
             for i in range(len(lines) - 1, -1, -1):
                 if "Checking Indian time:" in lines[i]:
                     lines.pop(i)  # Delete the line
                     break
-            
+
             # Append new checking time log at the end
             lines.append(new_log_line)
-            
+
             # Write back to file
             with open(LOG_FILE, "w", encoding='utf-8') as f:
                 f.writelines(lines)
@@ -93,7 +93,7 @@ def replace_last_checking_log(message):
             # If log file doesn't exist, create it with the new log
             with open(LOG_FILE, "w", encoding='utf-8') as f:
                 f.write(new_log_line)
-                
+
     except Exception as e:
         # Fallback to regular logging if replacement fails
         write_log("INFO", message)
@@ -106,7 +106,7 @@ def load_subscriptions():
         if db is None:
             write_log("ERROR", "MongoDB not initialized")
             return {}
-        
+
         subscriptions = {}
         cursor = db.subscriptions.find()
         for doc in cursor:
@@ -116,7 +116,7 @@ def load_subscriptions():
             if isinstance(suffixes, str):
                 suffixes = [suffixes]
             subscriptions[chat_id] = suffixes
-        
+
         return subscriptions
     except Exception as e:
         write_log("ERROR", f"Error loading subscriptions from MongoDB: {e}")
@@ -128,10 +128,10 @@ def save_subscriptions(subscriptions):
         if db is None:
             write_log("ERROR", "MongoDB not initialized")
             return
-        
+
         # Clear existing subscriptions
         db.subscriptions.delete_many({})
-        
+
         # Insert new subscriptions
         for chat_id, suffixes in subscriptions.items():
             if suffixes:  # Only save if user has subscriptions
@@ -140,7 +140,7 @@ def save_subscriptions(subscriptions):
                     'suffixes': suffixes,
                     'updated_at': datetime.now(INDIAN_TIMEZONE)
                 })
-        
+
         write_log("INFO", "Subscriptions saved to MongoDB successfully")
     except Exception as e:
         write_log("ERROR", f"Error saving subscriptions to MongoDB: {e}")
@@ -152,7 +152,7 @@ def load_proxies():
         if db is None:
             write_log("ERROR", "MongoDB not initialized")
             return {"proxies": [], "failed": []}
-        
+
         # Get proxies document
         proxies_doc = db.proxies.find_one({'_id': 'proxy_config'})
         if proxies_doc:
@@ -180,7 +180,7 @@ def save_proxies(proxies_data):
         if db is None:
             write_log("ERROR", "MongoDB not initialized")
             return
-        
+
         # Update or insert proxies configuration
         db.proxies.replace_one(
             {'_id': 'proxy_config'},
@@ -192,7 +192,7 @@ def save_proxies(proxies_data):
             },
             upsert=True
         )
-        
+
         write_log("INFO", "Proxies saved to MongoDB successfully")
     except Exception as e:
         write_log("ERROR", f"Error saving proxies to MongoDB: {e}")
@@ -504,7 +504,7 @@ def check_proxies_and_fetch(url,
             else:
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
             write_log("INFO", "Direct request SUCCESS")
-            return
+            return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
             final_error = f"❌ All connection methods failed.\n\nDirect request error: {error}"
@@ -515,7 +515,7 @@ def check_proxies_and_fetch(url,
                     bot.send_message(chat_id, final_error)
             else:
                 bot.send_message(chat_id, final_error)
-            return
+            return False
 
     proxies = proxies_data["proxies"]
     failed_proxies = proxies_data.get("failed", [])
@@ -557,7 +557,7 @@ def check_proxies_and_fetch(url,
             else:
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
             write_log("INFO", "Direct request SUCCESS")
-            return
+            return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
             final_error = f"❌ All connection methods failed.\n\nDirect request error: {error}"
@@ -568,7 +568,7 @@ def check_proxies_and_fetch(url,
                     bot.send_message(chat_id, final_error)
             else:
                 bot.send_message(chat_id, final_error)
-            return
+            return False
 
     # Try each proxy
     for proxy_entry in proxies:
@@ -600,7 +600,7 @@ def check_proxies_and_fetch(url,
                                      parse_mode='HTML')
 
                 write_log("INFO", f"Proxy {proxy} ({scheme}) SUCCESS")
-                break
+                return True
             else:
                 if proxy_entry not in failed_proxies:
                     failed_proxies.append(proxy_entry)
@@ -639,6 +639,7 @@ def check_proxies_and_fetch(url,
             else:
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
             write_log("INFO", "Direct request SUCCESS (fallback)")
+            return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
             final_error = f"❌ All proxies and direct connection failed.\n\nLast error: {error}"
@@ -649,6 +650,8 @@ def check_proxies_and_fetch(url,
                     bot.send_message(chat_id, final_error)
             else:
                 bot.send_message(chat_id, final_error)
+            return False
+    return False
 
 
 # Check Indian time and run automatic updates
@@ -685,11 +688,28 @@ def check_indian_time_and_update():
                         f"Running automatic /rf for user {chat_id} with {len(suffixes)} subscription(s)"
                     )
 
+                    all_failed = True  # Assume all requests will fail initially
+
                     for suffix in suffixes:
                         url = f"{URL_PREFIX}{suffix}"
-                        check_proxies_and_fetch(url, chat_id, suffix=suffix)
+                        if check_proxies_and_fetch(url, chat_id, suffix=suffix):
+                            all_failed = False  # At least one request succeeded
+
                         time.sleep(
                             1)  # Small delay between multiple subscriptions
+
+                    # Retry failed subscriptions at 17th minute
+                    if all_failed:
+                        write_log("INFO", "All proxies and direct connection failed at 16 minutes, checking at 17 minutes")
+                        time.sleep(60)  # Wait for 17th minute
+                        indian_time = datetime.now(INDIAN_TIMEZONE)
+                        if indian_time.minute == 17:
+                            for suffix in suffixes:
+                                url = f"{URL_PREFIX}{suffix}"
+                                check_proxies_and_fetch(url, chat_id, suffix=suffix)
+                                time.sleep(1)
+                        else:
+                            write_log("INFO", "It is not 17 minute anymore, skipping the retry")
 
                 except Exception as e:
                     write_log(
@@ -863,7 +883,7 @@ def subscribe(message):
 
         # Update message with success and show data
         bot.edit_message_text(
-            f"✅ <b>Successfully subscribed!</b>\n\n📡 <b>Station ID:</b> {suffix}\n📊 <b>Total subscriptions:</b> {len(subscriptions[chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}\n🔄 Fetching initial data...",
+            f"✅ <b>Successfully subscribed!</b>\n\n\n📡 <b>Station ID:</b> {suffix}\n📊 <b>Total subscriptions:</b> {len(subscriptions[chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}\n🔄 Fetching initial data...",
             chat_id,
             val_msg.message_id,
             parse_mode='HTML')
@@ -1279,7 +1299,7 @@ if __name__ == "__main__":
             write_log("CRITICAL", "Failed to initialize MongoDB. Exiting...")
             print("Failed to connect to MongoDB. Please check your MONGO_URI environment variable.")
             exit(1)
-        
+
         # Start Indian time checker in a background thread
         threading.Thread(target=run_indian_time_checker, daemon=True).start()
         write_log("INFO", "Bot started successfully")
