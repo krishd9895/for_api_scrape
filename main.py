@@ -1,23 +1,43 @@
 import os
-import json
 import requests
 import telebot
-import schedule
+from datetime import timezone, timedelta
 import time
 import threading
 from requests.exceptions import RequestException, ProxyError, ConnectTimeout
 from datetime import datetime, timedelta
 from uuid import uuid4
 import re
-from webserver import keep_alive
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 # Telegram bot token (replace with your bot token)
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# File paths for data storage
-SUBSCRIPTIONS_FILE = "subscriptions.json"
-PROXIES_FILE = "proxies.json"
+# MongoDB connection
+MONGO_URI = os.environ.get('MONGO_URI')
+if not MONGO_URI:
+    raise ValueError("MONGO_URI environment variable is required")
+
+# Initialize MongoDB client
+mongo_client = None
+db = None
+
+def init_mongodb():
+    global mongo_client, db
+    try:
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # Test the connection
+        mongo_client.admin.command('ping')
+        db = mongo_client.weather_bot
+        write_log("INFO", "MongoDB connection established successfully")
+        return True
+    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+        write_log("ERROR", f"Failed to connect to MongoDB: {e}")
+        return False
+
+# File path for logs only (other data now in MongoDB)
 LOG_FILE = "logs.txt"
 
 # Owner's Telegram ID (replace with your Telegram ID)
@@ -29,91 +49,181 @@ URL_PREFIX = os.environ.get('URL_PREFIX')
 # Maximum subscriptions per user
 MAX_SUBSCRIPTIONS_PER_USER = 4
 
+# Indian timezone (UTC+5:30)
+INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+
 
 # Enhanced logging function with error handling
 def write_log(level, message):
     try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Use Indian timezone for logging
+        timestamp = datetime.now(INDIAN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S IST")
         with open(LOG_FILE, "a", encoding='utf-8') as f:
             f.write(f"{timestamp} - {level.upper()} - {message}\n")
     except Exception as e:
         # If logging fails, print to console as fallback
-        print(f"LOG ERROR: {e} | Original message: {level.upper()} - {message}")
+        print(
+            f"LOG ERROR: {e} | Original message: {level.upper()} - {message}")
 
 
-# Load or initialize subscriptions with error handling
+# Function to delete previous checking time log and append new one at the end
+def replace_last_checking_log(message):
+    try:
+        timestamp = datetime.now(INDIAN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S IST")
+        new_log_line = f"{timestamp} - INFO - {message}\n"
+        
+        # Read all existing logs
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # Remove the last "Checking Indian time" log if it exists
+            for i in range(len(lines) - 1, -1, -1):
+                if "Checking Indian time:" in lines[i]:
+                    lines.pop(i)  # Delete the line
+                    break
+            
+            # Append new checking time log at the end
+            lines.append(new_log_line)
+            
+            # Write back to file
+            with open(LOG_FILE, "w", encoding='utf-8') as f:
+                f.writelines(lines)
+        else:
+            # If log file doesn't exist, create it with the new log
+            with open(LOG_FILE, "w", encoding='utf-8') as f:
+                f.write(new_log_line)
+                
+    except Exception as e:
+        # Fallback to regular logging if replacement fails
+        write_log("INFO", message)
+        print(f"LOG REPLACE ERROR: {e}")
+
+
+# Load subscriptions from MongoDB
 def load_subscriptions():
     try:
-        if os.path.exists(SUBSCRIPTIONS_FILE):
-            with open(SUBSCRIPTIONS_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # Convert old format to new format if needed
-                if data and isinstance(list(data.values())[0], str):
-                    # Old format: {"chat_id": "suffix"}
-                    # New format: {"chat_id": ["suffix1", "suffix2", ...]}
-                    new_data = {}
-                    for chat_id, suffix in data.items():
-                        new_data[chat_id] = [suffix]
-                    save_subscriptions(new_data)
-                    return new_data
-                return data
-        return {}
+        if db is None:
+            write_log("ERROR", "MongoDB not initialized")
+            return {}
+        
+        subscriptions = {}
+        cursor = db.subscriptions.find()
+        for doc in cursor:
+            chat_id = doc['chat_id']
+            suffixes = doc.get('suffixes', [])
+            # Handle old format conversion
+            if isinstance(suffixes, str):
+                suffixes = [suffixes]
+            subscriptions[chat_id] = suffixes
+        
+        return subscriptions
     except Exception as e:
-        write_log("ERROR", f"Error loading subscriptions: {e}")
+        write_log("ERROR", f"Error loading subscriptions from MongoDB: {e}")
         return {}
 
 
 def save_subscriptions(subscriptions):
     try:
-        with open(SUBSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(subscriptions, f, indent=4)
+        if db is None:
+            write_log("ERROR", "MongoDB not initialized")
+            return
+        
+        # Clear existing subscriptions
+        db.subscriptions.delete_many({})
+        
+        # Insert new subscriptions
+        for chat_id, suffixes in subscriptions.items():
+            if suffixes:  # Only save if user has subscriptions
+                db.subscriptions.insert_one({
+                    'chat_id': chat_id,
+                    'suffixes': suffixes,
+                    'updated_at': datetime.now(INDIAN_TIMEZONE)
+                })
+        
+        write_log("INFO", "Subscriptions saved to MongoDB successfully")
     except Exception as e:
-        write_log("ERROR", f"Error saving subscriptions: {e}")
+        write_log("ERROR", f"Error saving subscriptions to MongoDB: {e}")
 
 
-# Load or initialize proxies with error handling
+# Load proxies from MongoDB
 def load_proxies():
     try:
-        if os.path.exists(PROXIES_FILE):
-            with open(PROXIES_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {"proxies": [], "failed": []}
+        if db is None:
+            write_log("ERROR", "MongoDB not initialized")
+            return {"proxies": [], "failed": []}
+        
+        # Get proxies document
+        proxies_doc = db.proxies.find_one({'_id': 'proxy_config'})
+        if proxies_doc:
+            return {
+                'proxies': proxies_doc.get('proxies', []),
+                'failed': proxies_doc.get('failed', [])
+            }
+        else:
+            # Create default document if it doesn't exist
+            default_config = {"proxies": [], "failed": []}
+            db.proxies.insert_one({
+                '_id': 'proxy_config',
+                'proxies': [],
+                'failed': [],
+                'updated_at': datetime.now(INDIAN_TIMEZONE)
+            })
+            return default_config
     except Exception as e:
-        write_log("ERROR", f"Error loading proxies: {e}")
+        write_log("ERROR", f"Error loading proxies from MongoDB: {e}")
         return {"proxies": [], "failed": []}
 
 
 def save_proxies(proxies_data):
     try:
-        with open(PROXIES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(proxies_data, f, indent=4)
+        if db is None:
+            write_log("ERROR", "MongoDB not initialized")
+            return
+        
+        # Update or insert proxies configuration
+        db.proxies.replace_one(
+            {'_id': 'proxy_config'},
+            {
+                '_id': 'proxy_config',
+                'proxies': proxies_data.get('proxies', []),
+                'failed': proxies_data.get('failed', []),
+                'updated_at': datetime.now(INDIAN_TIMEZONE)
+            },
+            upsert=True
+        )
+        
+        write_log("INFO", "Proxies saved to MongoDB successfully")
     except Exception as e:
-        write_log("ERROR", f"Error saving proxies: {e}")
+        write_log("ERROR", f"Error saving proxies to MongoDB: {e}")
 
 
 # Convert 24-hour time to 12-hour AM/PM format with date
 def convert_to_12hour(datetime_str):
     try:
-        # Handle full date-time string (e.g., "27/05/2025 21:00")
-        if ' ' in datetime_str:
+        # Handle full date-time string (e.g., "27/05/2025 21:00" or "27/05/2025 23:00")
+        if ' ' in datetime_str and ':' in datetime_str:
             date_part, time_part = datetime_str.split(' ', 1)
 
             # Parse hour and minute
-            hour, minute = map(int, time_part.split(':'))
+            if ':' in time_part:
+                hour, minute = map(int, time_part.split(':'))
 
-            # Convert to 12-hour format
-            if hour == 0:
-                time_12h = f"12:{minute:02d} AM"
-            elif hour < 12:
-                time_12h = f"{hour}:{minute:02d} AM"
-            elif hour == 12:
-                time_12h = f"12:{minute:02d} PM"
+                # Convert to 12-hour format
+                if hour == 0:
+                    time_12h = f"12:{minute:02d} AM"
+                elif hour < 12:
+                    time_12h = f"{hour}:{minute:02d} AM"
+                elif hour == 12:
+                    time_12h = f"12:{minute:02d} PM"
+                else:
+                    time_12h = f"{hour-12}:{minute:02d} PM"
+
+                return f"{date_part} {time_12h}"
             else:
-                time_12h = f"{hour-12}:{minute:02d} PM"
-
-            return f"{date_part} {time_12h}"
-        else:
-            # If no space, assume it's just time
+                return datetime_str
+        elif ':' in datetime_str and '/' not in datetime_str:
+            # If no space but has colon, assume it's just time
             hour, minute = map(int, datetime_str.split(':'))
             if hour == 0:
                 return f"12:{minute:02d} AM"
@@ -123,6 +233,8 @@ def convert_to_12hour(datetime_str):
                 return f"12:{minute:02d} PM"
             else:
                 return f"{hour-12}:{minute:02d} PM"
+        else:
+            return datetime_str
     except:
         return datetime_str  # Return original if conversion fails
 
@@ -140,23 +252,30 @@ def match_field_type(key):
         return 'location', '📍'
 
     # Mandal/Area matching
-    if any(word in key_lower for word in ['mandal', 'area', 'district', 'region']):
+    if any(word in key_lower
+           for word in ['mandal', 'area', 'district', 'region']):
         return 'mandal', '🏘️'
 
-    # Date matching
+    # Last Updated matching - Check for "updated" or "last" specifically first
+    if any(word in key_lower for word in ['updated', 'last']):
+        return 'updated', '🕐'
+
+    # Date matching - Check for "date" fields (including "Date & Time")
     if any(word in key_lower for word in ['date', 'day']):
         return 'date', '📅'
 
-    # Time/Updated matching (Last Updated, Updated, Time, etc.)
-    if any(word in key_lower for word in ['updated', 'time', 'last']):
+    # Generic time matching - only if not caught by above
+    if 'time' in key_lower and not any(word in key_lower for word in ['date', 'updated', 'last']):
         return 'updated', '🕐'
 
     # Rainfall matching
-    if any(word in key_lower for word in ['rainfall', 'rain', 'precipitation']):
+    if any(word in key_lower
+           for word in ['rainfall', 'rain', 'precipitation']):
         return 'rainfall', '🌧️'
 
     # Temperature matching
-    if any(word in key_lower for word in ['temperature', 'temp', 'celsius', 'fahrenheit']):
+    if any(word in key_lower
+           for word in ['temperature', 'temp', 'celsius', 'fahrenheit']):
         return 'temperature', '🌡️'
 
     # Humidity matching
@@ -180,11 +299,11 @@ def fetch_table_data_direct(url):
     try:
         response = requests.get(url, timeout=10)
         html = response.text
-        
+
         # Check for invalid range error
         if "Invalid Range" in html:
             return None, "Invalid station ID - station does not exist"
-        
+
         table_start = html.find('<table')
         table_end = html.find('</table>') + len('</table>')
         if table_start == -1 or table_end == -1:
@@ -236,11 +355,11 @@ def fetch_table_data(url, proxy, scheme):
                                 },
                                 timeout=10)
         html = response.text
-        
+
         # Check for invalid range error
         if "Invalid Range" in html:
             return None, "Invalid station ID - station does not exist"
-        
+
         table_start = html.find('<table')
         table_end = html.find('</table>') + len('</table>')
         if table_start == -1 or table_end == -1:
@@ -322,7 +441,8 @@ def format_table_data(table_data, suffix=None):
             message += f"{emoji} <b>{key}:</b> {value}\n"
         elif field_type == 'temperature':
             # Add °C if not present and value is numeric
-            if value.replace('.', '').replace('-', '').isdigit() and '°' not in value:
+            if value.replace('.', '').replace(
+                    '-', '').isdigit() and '°' not in value:
                 message += f"{emoji} <b>{key}:</b> {value}°C\n"
             else:
                 message += f"{emoji} <b>{key}:</b> {value}\n"
@@ -343,16 +463,27 @@ def format_table_data(table_data, suffix=None):
 
 
 # Check proxies and fetch data for a user
-def check_proxies_and_fetch(url, chat_id, message_id=None, is_manual=False, suffix=None):
+def check_proxies_and_fetch(url,
+                            chat_id,
+                            message_id=None,
+                            is_manual=False,
+                            suffix=None):
     proxies_data = load_proxies()
 
     # Check if proxies data is valid
-    if not proxies_data or "proxies" not in proxies_data or not isinstance(proxies_data["proxies"], list):
+    if not proxies_data or "proxies" not in proxies_data or not isinstance(
+            proxies_data["proxies"], list):
         error_msg = "❌ Proxies configuration is invalid or empty."
-        write_log("ERROR", "Proxies JSON is empty, has wrong indentation, or invalid structure")
+        write_log(
+            "ERROR",
+            "Proxies configuration is empty or invalid structure"
+        )
 
         if str(chat_id) != OWNER_ID:
-            bot.send_message(OWNER_ID, "🚨 Proxies configuration is invalid or empty. Check proxies.json file.")
+            bot.send_message(
+                OWNER_ID,
+                "🚨 Proxies configuration is invalid or empty. Check MongoDB proxy configuration."
+            )
 
         # Try direct request as fallback
         write_log("INFO", "Attempting direct request without proxy")
@@ -362,9 +493,14 @@ def check_proxies_and_fetch(url, chat_id, message_id=None, is_manual=False, suff
             formatted_data = format_table_data(table_data, suffix)
             if message_id:
                 try:
-                    bot.edit_message_text(formatted_data, chat_id, message_id, parse_mode='HTML')
+                    bot.edit_message_text(formatted_data,
+                                          chat_id,
+                                          message_id,
+                                          parse_mode='HTML')
                 except Exception as e:
-                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                    bot.send_message(chat_id,
+                                     formatted_data,
+                                     parse_mode='HTML')
             else:
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
             write_log("INFO", "Direct request SUCCESS")
@@ -387,7 +523,8 @@ def check_proxies_and_fetch(url, chat_id, message_id=None, is_manual=False, suff
 
     # Send acknowledgment message for manual fetch
     if is_manual and not message_id:
-        ack_msg = bot.send_message(chat_id, "🔄 Fetching latest weather data...")
+        ack_msg = bot.send_message(chat_id,
+                                   "🔄 Fetching latest weather data...")
         message_id = ack_msg.message_id
 
     # Check if there are any proxies to use
@@ -396,7 +533,10 @@ def check_proxies_and_fetch(url, chat_id, message_id=None, is_manual=False, suff
         write_log("ERROR", "Proxies list is empty")
 
         if str(chat_id) != OWNER_ID:
-            bot.send_message(OWNER_ID, "🚨 No proxies available. Please add proxies to proxies.json file.")
+            bot.send_message(
+                OWNER_ID,
+                "🚨 No proxies available. Please add proxies using /update_proxy command."
+            )
 
         # Try direct request as fallback
         write_log("INFO", "No proxies available, attempting direct request")
@@ -406,9 +546,14 @@ def check_proxies_and_fetch(url, chat_id, message_id=None, is_manual=False, suff
             formatted_data = format_table_data(table_data, suffix)
             if message_id:
                 try:
-                    bot.edit_message_text(formatted_data, chat_id, message_id, parse_mode='HTML')
+                    bot.edit_message_text(formatted_data,
+                                          chat_id,
+                                          message_id,
+                                          parse_mode='HTML')
                 except Exception as e:
-                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                    bot.send_message(chat_id,
+                                     formatted_data,
+                                     parse_mode='HTML')
             else:
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
             write_log("INFO", "Direct request SUCCESS")
@@ -441,11 +586,18 @@ def check_proxies_and_fetch(url, chat_id, message_id=None, is_manual=False, suff
 
                 if message_id:
                     try:
-                        bot.edit_message_text(formatted_data, chat_id, message_id, parse_mode='HTML')
+                        bot.edit_message_text(formatted_data,
+                                              chat_id,
+                                              message_id,
+                                              parse_mode='HTML')
                     except Exception as e:
-                        bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                        bot.send_message(chat_id,
+                                         formatted_data,
+                                         parse_mode='HTML')
                 else:
-                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                    bot.send_message(chat_id,
+                                     formatted_data,
+                                     parse_mode='HTML')
 
                 write_log("INFO", f"Proxy {proxy} ({scheme}) SUCCESS")
                 break
@@ -454,28 +606,36 @@ def check_proxies_and_fetch(url, chat_id, message_id=None, is_manual=False, suff
                     failed_proxies.append(proxy_entry)
                     proxies_data["failed"] = failed_proxies
                     save_proxies(proxies_data)
-                    write_log("ERROR", f"Proxy {proxy} ({scheme}) failed: {error}")
+                    write_log("ERROR",
+                              f"Proxy {proxy} ({scheme}) failed: {error}")
 
                     if str(chat_id) != OWNER_ID:
                         bot.send_message(
                             OWNER_ID,
-                            f"🚨 Proxy failed: {proxy} ({scheme})\nError: {error}")
+                            f"🚨 Proxy failed: {proxy} ({scheme})\nError: {error}"
+                        )
         except Exception as e:
             write_log("ERROR", f"Error processing proxy {proxy_entry}: {e}")
             continue
 
     # If all proxies failed, try direct request
     if not success:
-        write_log("INFO", "All proxies failed, attempting direct request as fallback")
+        write_log("INFO",
+                  "All proxies failed, attempting direct request as fallback")
         table_data, error = fetch_table_data_direct(url)
 
         if table_data:
             formatted_data = format_table_data(table_data, suffix)
             if message_id:
                 try:
-                    bot.edit_message_text(formatted_data, chat_id, message_id, parse_mode='HTML')
+                    bot.edit_message_text(formatted_data,
+                                          chat_id,
+                                          message_id,
+                                          parse_mode='HTML')
                 except Exception as e:
-                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                    bot.send_message(chat_id,
+                                     formatted_data,
+                                     parse_mode='HTML')
             else:
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
             write_log("INFO", "Direct request SUCCESS (fallback)")
@@ -491,48 +651,75 @@ def check_proxies_and_fetch(url, chat_id, message_id=None, is_manual=False, suff
                 bot.send_message(chat_id, final_error)
 
 
-# Hourly update job for subscribed users with error handling
-def hourly_update():
+# Check Indian time and run automatic updates
+def check_indian_time_and_update():
     try:
-        now = datetime.now()
-        if now.minute == 16:
+        # Get current time in Indian timezone
+        indian_time = datetime.now(INDIAN_TIMEZONE)
+        current_minute = indian_time.minute
+
+        # Replace the last checking time log instead of appending
+        replace_last_checking_log(
+            f"Checking Indian time: {indian_time.strftime('%Y-%m-%d %H:%M:%S IST')}, minute: {current_minute}"
+        )
+
+        if current_minute == 7:
+            write_log(
+                "INFO",
+                "Indian time minute is 16, running automatic /rf command")
             subscriptions = load_subscriptions()
+
+            if not subscriptions:
+                write_log("INFO",
+                          "No subscriptions found for automatic update")
+                return
+
             for chat_id, suffixes in subscriptions.items():
                 try:
                     # Handle both old format (string) and new format (list)
                     if isinstance(suffixes, str):
                         suffixes = [suffixes]
 
+                    write_log(
+                        "INFO",
+                        f"Running automatic /rf for user {chat_id} with {len(suffixes)} subscription(s)"
+                    )
+
                     for suffix in suffixes:
                         url = f"{URL_PREFIX}{suffix}"
                         check_proxies_and_fetch(url, chat_id, suffix=suffix)
-                        time.sleep(1)  # Small delay between multiple subscriptions
+                        time.sleep(
+                            1)  # Small delay between multiple subscriptions
+
                 except Exception as e:
-                    write_log("ERROR", f"Error updating user {chat_id}: {e}")
+                    write_log(
+                        "ERROR",
+                        f"Error in automatic update for user {chat_id}: {e}")
                     # Continue with next user even if one fails
                     continue
+
+            write_log("INFO", "Completed automatic /rf command for all users")
+
     except Exception as e:
-        write_log("ERROR", f"Hourly update error: {e}")
+        write_log("ERROR", f"Error in check_indian_time_and_update: {e}")
 
 
-# Run scheduler in a separate thread with error handling
-def run_scheduler():
-    schedule.every().minute.do(hourly_update)
+# Run Indian time checker in a separate thread
+def run_indian_time_checker():
+    write_log(
+        "INFO",
+        "Starting Indian time checker - checking every minute for minute 16")
     while True:
         try:
-            schedule.run_pending()
-            time.sleep(60)
+            check_indian_time_and_update()
+            time.sleep(60)  # Check every minute
         except Exception as e:
-            write_log("ERROR", f"Scheduler error: {e}")
+            write_log("ERROR", f"Indian time checker error: {e}")
             time.sleep(60)  # Continue running even if there's an error
 
 
-# Start scheduler in a background thread
-threading.Thread(target=run_scheduler, daemon=True).start()
-
-
-# Command: /help with error handling
-@bot.message_handler(commands=['help'])
+# Command: /start with error handling
+@bot.message_handler(commands=['start'])
 def send_welcome(message):
     try:
         welcome_msg = f"""
@@ -557,7 +744,7 @@ def send_welcome(message):
 
 <b>Limits:</b> Maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions per user.
 
-You'll receive automatic updates every hour at 16 minutes past the hour.
+You'll receive automatic updates every hour at 16 minutes past the hour (Indian time).
         """
         bot.reply_to(message, welcome_msg, parse_mode='HTML')
     except Exception as e:
@@ -579,15 +766,13 @@ def subscribe(message):
                 bot.reply_to(
                     message,
                     "❌ Please provide a valid integer suffix.\n\n<b>Example:</b> <code>/subscribe 1057</code>",
-                    parse_mode='HTML'
-                )
+                    parse_mode='HTML')
                 return
         except IndexError:
             bot.reply_to(
                 message,
                 "❌ Please provide an integer suffix.\n\n<b>Example:</b> <code>/subscribe 1057</code>",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         subscriptions = load_subscriptions()
@@ -604,8 +789,7 @@ def subscribe(message):
             bot.reply_to(
                 message,
                 f"❌ <b>Subscription limit reached!</b>\n\nYou can have maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions.\n\nUse <code>/list</code> to view current subscriptions or <code>/unsubscribe &lt;number&gt;</code> to remove one.",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         # Check if already subscribed to this suffix
@@ -613,18 +797,15 @@ def subscribe(message):
             bot.reply_to(
                 message,
                 f"❌ You are already subscribed to station <b>{suffix}</b>.\n\nUse <code>/list</code> to view all subscriptions.",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         url = f"{URL_PREFIX}{suffix}"
 
         # Send validation message
-        val_msg = bot.reply_to(
-            message,
-            f"🔄 <b>Validating station ID {suffix}...</b>",
-            parse_mode='HTML'
-        )
+        val_msg = bot.reply_to(message,
+                               f"🔄 <b>Validating station ID {suffix}...</b>",
+                               parse_mode='HTML')
 
         # Validate station before subscribing
         proxies_data = load_proxies()
@@ -632,14 +813,15 @@ def subscribe(message):
         validation_error = None
 
         # Try with proxies first
-        if proxies_data and "proxies" in proxies_data and proxies_data["proxies"]:
+        if proxies_data and "proxies" in proxies_data and proxies_data[
+                "proxies"]:
             for proxy_entry in proxies_data["proxies"]:
                 try:
                     if ':' not in proxy_entry:
                         continue
                     proxy, scheme = proxy_entry.rsplit(':', 1)
                     table_data, error = fetch_table_data(url, proxy, scheme)
-                    
+
                     if table_data:
                         validation_success = True
                         break
@@ -663,8 +845,7 @@ def subscribe(message):
                 f"❌ <b>Invalid station ID!</b>\n\n📡 <b>Station ID:</b> {suffix}\n\n❗ This station does not exist. Please check the station ID and try again.",
                 chat_id,
                 val_msg.message_id,
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         if not validation_success:
@@ -672,8 +853,7 @@ def subscribe(message):
                 f"⚠️ <b>Unable to validate station</b>\n\n📡 <b>Station ID:</b> {suffix}\n\n🔄 Network issues detected. You can try subscribing again later.",
                 chat_id,
                 val_msg.message_id,
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         # Add subscription only after successful validation
@@ -686,16 +866,21 @@ def subscribe(message):
             f"✅ <b>Successfully subscribed!</b>\n\n📡 <b>Station ID:</b> {suffix}\n📊 <b>Total subscriptions:</b> {len(subscriptions[chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}\n🔄 Fetching initial data...",
             chat_id,
             val_msg.message_id,
-            parse_mode='HTML'
-        )
+            parse_mode='HTML')
 
         # Fetch and display initial data
-        check_proxies_and_fetch(url, chat_id, val_msg.message_id, suffix=suffix)
+        check_proxies_and_fetch(url,
+                                chat_id,
+                                val_msg.message_id,
+                                suffix=suffix)
 
     except Exception as e:
-        write_log("ERROR", f"Error in /subscribe command for user {chat_id}: {e}")
+        write_log("ERROR",
+                  f"Error in /subscribe command for user {chat_id}: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred during subscription. Please try again.")
+            bot.reply_to(
+                message,
+                "❌ Error occurred during subscription. Please try again.")
         except:
             pass
 
@@ -711,8 +896,7 @@ def list_subscriptions(message):
             bot.reply_to(
                 message,
                 "📋 <b>No active subscriptions</b>\n\nUse <code>/subscribe &lt;number&gt;</code> to subscribe to a weather station.",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         user_subs = subscriptions[chat_id]
@@ -730,7 +914,8 @@ def list_subscriptions(message):
     except Exception as e:
         write_log("ERROR", f"Error in /list command for user {chat_id}: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred while fetching subscriptions.")
+            bot.reply_to(message,
+                         "❌ Error occurred while fetching subscriptions.")
         except:
             pass
 
@@ -746,15 +931,13 @@ def unsubscribe(message):
                 bot.reply_to(
                     message,
                     "❌ Please provide a valid integer suffix.\n\n<b>Example:</b> <code>/unsubscribe 1057</code>",
-                    parse_mode='HTML'
-                )
+                    parse_mode='HTML')
                 return
         except IndexError:
             bot.reply_to(
                 message,
                 "❌ Please provide an integer suffix.\n\n<b>Example:</b> <code>/unsubscribe 1057</code>",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         subscriptions = load_subscriptions()
@@ -763,8 +946,7 @@ def unsubscribe(message):
             bot.reply_to(
                 message,
                 "❌ You have no active subscriptions.\n\nUse <code>/subscribe &lt;number&gt;</code> to subscribe first.",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         user_subs = subscriptions[chat_id]
@@ -776,8 +958,7 @@ def unsubscribe(message):
             bot.reply_to(
                 message,
                 f"❌ You are not subscribed to station <b>{suffix}</b>.\n\nUse <code>/list</code> to view your subscriptions.",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         # Remove subscription
@@ -796,13 +977,15 @@ def unsubscribe(message):
         bot.reply_to(
             message,
             f"✅ <b>Successfully unsubscribed!</b>\n\n📡 <b>Removed station:</b> {suffix}\n📊 <b>Remaining subscriptions:</b> {remaining}/{MAX_SUBSCRIPTIONS_PER_USER}",
-            parse_mode='HTML'
-        )
+            parse_mode='HTML')
 
     except Exception as e:
-        write_log("ERROR", f"Error in /unsubscribe command for user {chat_id}: {e}")
+        write_log("ERROR",
+                  f"Error in /unsubscribe command for user {chat_id}: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred during unsubscription. Please try again.")
+            bot.reply_to(
+                message,
+                "❌ Error occurred during unsubscription. Please try again.")
         except:
             pass
 
@@ -819,27 +1002,38 @@ def manual_fetch(message):
                 user_subs = [user_subs]
 
             # Send acknowledgment first
-            ack_msg = bot.reply_to(message, f"🔄 Fetching latest weather data for {len(user_subs)} station(s)...")
+            ack_msg = bot.reply_to(
+                message,
+                f"🔄 Fetching latest weather data for {len(user_subs)} station(s)..."
+            )
 
             for i, suffix in enumerate(user_subs):
                 url = f"{URL_PREFIX}{suffix}"
                 if i == 0:
                     # Edit the first message
-                    check_proxies_and_fetch(url, chat_id, ack_msg.message_id, is_manual=True, suffix=suffix)
+                    check_proxies_and_fetch(url,
+                                            chat_id,
+                                            ack_msg.message_id,
+                                            is_manual=True,
+                                            suffix=suffix)
                 else:
                     # Send new messages for additional subscriptions
-                    check_proxies_and_fetch(url, chat_id, is_manual=False, suffix=suffix)
+                    check_proxies_and_fetch(url,
+                                            chat_id,
+                                            is_manual=False,
+                                            suffix=suffix)
                     time.sleep(1)  # Small delay between requests
         else:
             bot.reply_to(
                 message,
                 "❌ You are not subscribed to any stations.\n\nUse <code>/subscribe &lt;number&gt;</code> to subscribe first.",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
     except Exception as e:
         write_log("ERROR", f"Error in /rf command for user {chat_id}: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred while fetching data. Please try again.")
+            bot.reply_to(
+                message,
+                "❌ Error occurred while fetching data. Please try again.")
         except:
             pass
 
@@ -884,8 +1078,7 @@ def update_proxy(message):
             bot.reply_to(
                 message,
                 "❌ Please provide proxy in format: <code>ip:port:protocol</code>\n\n<b>Example:</b> <code>/update_proxy 192.168.1.1:8080:http</code>",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         # Validate proxy format
@@ -893,56 +1086,57 @@ def update_proxy(message):
             bot.reply_to(
                 message,
                 "❌ Invalid proxy format. Use: <code>ip:port:protocol</code>\n\n<b>Examples:</b>\n• <code>192.168.1.1:8080:http</code>\n• <code>10.0.0.1:1080:socks5</code>",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         ip, port, protocol = proxy_entry.split(':')
-        
+
         # Basic validation
-        if not ip or not port.isdigit() or protocol.lower() not in ['http', 'https', 'socks4', 'socks5']:
+        if not ip or not port.isdigit() or protocol.lower() not in [
+                'http', 'https', 'socks4', 'socks5'
+        ]:
             bot.reply_to(
                 message,
                 "❌ Invalid proxy details.\n\n<b>Requirements:</b>\n• Valid IP address\n• Numeric port\n• Protocol: http, https, socks4, or socks5",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         proxies_data = load_proxies()
-        
+
         # Check if proxy already exists
         if proxy_entry in proxies_data.get("proxies", []):
             bot.reply_to(
                 message,
                 f"⚠️ Proxy <code>{proxy_entry}</code> already exists in the list.",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         # Remove from failed list if it exists there
         if proxy_entry in proxies_data.get("failed", []):
             proxies_data["failed"].remove(proxy_entry)
-            write_log("INFO", f"Removed {proxy_entry} from failed proxies list")
+            write_log("INFO",
+                      f"Removed {proxy_entry} from failed proxies list")
 
         # Add to active proxies list
         if "proxies" not in proxies_data:
             proxies_data["proxies"] = []
-        
+
         proxies_data["proxies"].append(proxy_entry)
         save_proxies(proxies_data)
-        
+
         write_log("INFO", f"Owner added new proxy: {proxy_entry}")
-        
+
         bot.reply_to(
             message,
             f"✅ <b>Proxy added successfully!</b>\n\n📡 <b>Proxy:</b> <code>{ip}:{port}</code>\n🔗 <b>Protocol:</b> {protocol.upper()}\n📊 <b>Total proxies:</b> {len(proxies_data['proxies'])}",
-            parse_mode='HTML'
-        )
+            parse_mode='HTML')
 
     except Exception as e:
         write_log("ERROR", f"Error in /update_proxy command: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred while adding proxy. Please try again.")
+            bot.reply_to(
+                message,
+                "❌ Error occurred while adding proxy. Please try again.")
         except:
             pass
 
@@ -963,23 +1157,21 @@ def delete_proxy(message):
             bot.reply_to(
                 message,
                 "❌ Please provide proxy to delete in format: <code>ip:port:protocol</code>\n\n<b>Example:</b> <code>/delete_proxy 192.168.1.1:8080:http</code>",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         proxies_data = load_proxies()
-        
+
         # Check if proxy exists in active list
         if proxy_entry in proxies_data.get("proxies", []):
             proxies_data["proxies"].remove(proxy_entry)
             save_proxies(proxies_data)
             write_log("INFO", f"Owner deleted proxy: {proxy_entry}")
-            
+
             bot.reply_to(
                 message,
                 f"✅ <b>Proxy deleted successfully!</b>\n\n📡 <b>Removed:</b> <code>{proxy_entry}</code>\n📊 <b>Remaining proxies:</b> {len(proxies_data.get('proxies', []))}",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         # Check if proxy exists in failed list
@@ -987,25 +1179,25 @@ def delete_proxy(message):
             proxies_data["failed"].remove(proxy_entry)
             save_proxies(proxies_data)
             write_log("INFO", f"Owner deleted failed proxy: {proxy_entry}")
-            
+
             bot.reply_to(
                 message,
                 f"✅ <b>Failed proxy deleted successfully!</b>\n\n📡 <b>Removed:</b> <code>{proxy_entry}</code>",
-                parse_mode='HTML'
-            )
+                parse_mode='HTML')
             return
 
         # Proxy not found
         bot.reply_to(
             message,
             f"❌ <b>Proxy not found!</b>\n\n📡 <b>Proxy:</b> <code>{proxy_entry}</code>\n\nUse <code>/proxy_list</code> to see available proxies.",
-            parse_mode='HTML'
-        )
+            parse_mode='HTML')
 
     except Exception as e:
         write_log("ERROR", f"Error in /delete_proxy command: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred while deleting proxy. Please try again.")
+            bot.reply_to(
+                message,
+                "❌ Error occurred while deleting proxy. Please try again.")
         except:
             pass
 
@@ -1057,7 +1249,10 @@ def proxy_list(message):
     except Exception as e:
         write_log("ERROR", f"Error in /proxy_list command: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred while fetching proxy list. Please try again.")
+            bot.reply_to(
+                message,
+                "❌ Error occurred while fetching proxy list. Please try again."
+            )
         except:
             pass
 
@@ -1075,12 +1270,18 @@ def start_bot():
             time.sleep(5)  # Wait before restarting
             continue
 
-keep_alive()
+
 # Start the bot
 if __name__ == "__main__":
     try:
-        # Start scheduler in a background thread
-        threading.Thread(target=run_scheduler, daemon=True).start()
+        # Initialize MongoDB connection
+        if not init_mongodb():
+            write_log("CRITICAL", "Failed to initialize MongoDB. Exiting...")
+            print("Failed to connect to MongoDB. Please check your MONGO_URI environment variable.")
+            exit(1)
+        
+        # Start Indian time checker in a background thread
+        threading.Thread(target=run_indian_time_checker, daemon=True).start()
         write_log("INFO", "Bot started successfully")
         start_bot()
     except KeyboardInterrupt:
@@ -1090,3 +1291,8 @@ if __name__ == "__main__":
         write_log("CRITICAL", f"Fatal error: {e}")
         print(f"Fatal error: {e}")
         print("Bot will restart automatically...")
+    finally:
+        # Close MongoDB connection
+        if mongo_client:
+            mongo_client.close()
+            write_log("INFO", "MongoDB connection closed")
