@@ -663,7 +663,7 @@ def check_indian_time_and_update():
             f"Checking Indian time: {indian_time.strftime('%Y-%m-%d %H:%M:%S IST')}, minute: {current_minute}"
         )
 
-        if current_minute == 7:
+        if current_minute == 16:
             write_log(
                 "INFO",
                 "Indian time minute is 16, running automatic /rf command")
