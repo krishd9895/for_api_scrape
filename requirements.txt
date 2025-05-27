@@ -1,5 +1,5 @@
-Flask
 requests
-selenium
-zipfile36
-bs4
+pyTelegramBotAPI
+schedule
+Flask
+PySocks
