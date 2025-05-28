@@ -1,5 +1,5 @@
 from flask import Flask
-from threading import Thread
+import os
 
 app = Flask(__name__)
 
@@ -7,9 +7,6 @@ app = Flask(__name__)
 def home():
     return "I'm alive"
 
-def run():
-    app.run(host='0.0.0.0', port=5096)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))  # Get PORT from environment, fallback to 5000
+    app.run(host='0.0.0.0', port=port)
