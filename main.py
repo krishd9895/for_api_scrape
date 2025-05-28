@@ -10,6 +10,7 @@ from uuid import uuid4
 import re
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+from webserver import keep_alive
 
 # Telegram bot token (replace with your bot token)
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -1628,7 +1629,7 @@ def start_bot():
             time.sleep(5)  # Wait before restarting
             continue
 
-
+keep_alive()
 # Start the bot
 if __name__ == "__main__":
     try:
