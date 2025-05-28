@@ -24,6 +24,7 @@ if not MONGO_URI:
 mongo_client = None
 db = None
 
+
 def init_mongodb():
     global mongo_client, db
     try:
@@ -36,6 +37,7 @@ def init_mongodb():
     except (ConnectionFailure, ServerSelectionTimeoutError) as e:
         write_log("ERROR", f"Failed to connect to MongoDB: {e}")
         return False
+
 
 # File path for logs only (other data now in MongoDB)
 LOG_FILE = "logs.txt"
@@ -57,7 +59,8 @@ INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 def write_log(level, message):
     try:
         # Use Indian timezone for logging
-        timestamp = datetime.now(INDIAN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S IST")
+        timestamp = datetime.now(INDIAN_TIMEZONE).strftime(
+            "%Y-%m-%d %H:%M:%S IST")
         with open(LOG_FILE, "a", encoding='utf-8') as f:
             f.write(f"{timestamp} - {level.upper()} - {message}\n")
     except Exception as e:
@@ -69,7 +72,8 @@ def write_log(level, message):
 # Function to delete previous checking time log and append new one at the end
 def replace_last_checking_log(message):
     try:
-        timestamp = datetime.now(INDIAN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S IST")
+        timestamp = datetime.now(INDIAN_TIMEZONE).strftime(
+            "%Y-%m-%d %H:%M:%S IST")
         new_log_line = f"{timestamp} - INFO - {message}\n"
 
         # Read all existing logs
@@ -136,9 +140,12 @@ def save_subscriptions(subscriptions):
         for chat_id, suffixes in subscriptions.items():
             if suffixes:  # Only save if user has subscriptions
                 db.subscriptions.insert_one({
-                    'chat_id': chat_id,
-                    'suffixes': suffixes,
-                    'updated_at': datetime.now(INDIAN_TIMEZONE)
+                    'chat_id':
+                    chat_id,
+                    'suffixes':
+                    suffixes,
+                    'updated_at':
+                    datetime.now(INDIAN_TIMEZONE)
                 })
 
         write_log("INFO", "Subscriptions saved to MongoDB successfully")
@@ -182,16 +189,13 @@ def save_proxies(proxies_data):
             return
 
         # Update or insert proxies configuration
-        db.proxies.replace_one(
-            {'_id': 'proxy_config'},
-            {
-                '_id': 'proxy_config',
-                'proxies': proxies_data.get('proxies', []),
-                'failed': proxies_data.get('failed', []),
-                'updated_at': datetime.now(INDIAN_TIMEZONE)
-            },
-            upsert=True
-        )
+        db.proxies.replace_one({'_id': 'proxy_config'}, {
+            '_id': 'proxy_config',
+            'proxies': proxies_data.get('proxies', []),
+            'failed': proxies_data.get('failed', []),
+            'updated_at': datetime.now(INDIAN_TIMEZONE)
+        },
+                               upsert=True)
 
         write_log("INFO", "Proxies saved to MongoDB successfully")
     except Exception as e:
@@ -265,7 +269,8 @@ def match_field_type(key):
         return 'date', '📅'
 
     # Generic time matching - only if not caught by above
-    if 'time' in key_lower and not any(word in key_lower for word in ['date', 'updated', 'last']):
+    if 'time' in key_lower and not any(
+            word in key_lower for word in ['date', 'updated', 'last']):
         return 'updated', '🕐'
 
     # Rainfall matching
@@ -474,10 +479,8 @@ def check_proxies_and_fetch(url,
     if not proxies_data or "proxies" not in proxies_data or not isinstance(
             proxies_data["proxies"], list):
         error_msg = "❌ Proxies configuration is invalid or empty."
-        write_log(
-            "ERROR",
-            "Proxies configuration is empty or invalid structure"
-        )
+        write_log("ERROR",
+                  "Proxies configuration is empty or invalid structure")
 
         if str(chat_id) != OWNER_ID:
             bot.send_message(
@@ -692,7 +695,8 @@ def check_indian_time_and_update():
 
                     for suffix in suffixes:
                         url = f"{URL_PREFIX}{suffix}"
-                        if check_proxies_and_fetch(url, chat_id, suffix=suffix):
+                        if check_proxies_and_fetch(url, chat_id,
+                                                   suffix=suffix):
                             all_failed = False  # At least one request succeeded
 
                         time.sleep(
@@ -700,16 +704,24 @@ def check_indian_time_and_update():
 
                     # Retry failed subscriptions at 17th minute
                     if all_failed:
-                        write_log("INFO", "All proxies and direct connection failed at 16 minutes, checking at 17 minutes")
+                        write_log(
+                            "INFO",
+                            "All proxies and direct connection failed at 16 minutes, checking at 17 minutes"
+                        )
                         time.sleep(60)  # Wait for 17th minute
                         indian_time = datetime.now(INDIAN_TIMEZONE)
                         if indian_time.minute == 17:
                             for suffix in suffixes:
                                 url = f"{URL_PREFIX}{suffix}"
-                                check_proxies_and_fetch(url, chat_id, suffix=suffix)
+                                check_proxies_and_fetch(url,
+                                                        chat_id,
+                                                        suffix=suffix)
                                 time.sleep(1)
                         else:
-                            write_log("INFO", "It is not 17 minute anymore, skipping the retry")
+                            write_log(
+                                "INFO",
+                                "It is not 17 minute anymore, skipping the retry"
+                            )
 
                 except Exception as e:
                     write_log(
@@ -738,45 +750,74 @@ def run_indian_time_checker():
             time.sleep(60)  # Continue running even if there's an error
 
 
-# Command: /start with error handling
+# Command: /help - Show help text (different for users and owner)
 @bot.message_handler(commands=['help'])
-def send_welcome(message):
+def send_help(message):
     try:
-        welcome_msg = f"""
-🌦️ <b>Welcome to Weather Update Bot!</b>
+        chat_id = str(message.chat.id)
+        is_owner = chat_id == OWNER_ID
 
-<b>Available Commands:</b>
-• <code>/subscribe &lt;number&gt;</code> - Subscribe to weather updates
+        if is_owner:
+            help_msg = f"""
+🌦️ <b>Weather Update Bot - Owner Help</b>
+
+<b>User Commands:</b>
+• <code>/start</code> - Start the bot and see welcome message
+• <code>/help</code> - Show this help message
+• <code>/subscribe number</code> - Subscribe to weather updates for a station
 • <code>/list</code> - View your subscriptions with serial numbers
-• <code>/unsubscribe &lt;serial_number&gt;</code> - Remove a subscription
+• <code>/unsubscribe serial_number</code> - Remove a subscription
 • <code>/rf</code> - Get latest weather data (manual refresh)
 
 <b>Owner Commands:</b>
-• <code>/logs</code> - View logs
+• <code>/logs</code> - Download bot logs
 • <code>/proxy_list</code> - View all proxies with serial numbers
-• <code>/update_proxy ip:port:protocol</code> - Add new proxy
-• <code>/delete_proxy &lt;serial_number&gt;</code> - Remove proxy
+• <code>/update_proxy ip:port:protocol</code> - Add a new proxy
+• <code>/delete_proxy serial_number</code> - Remove a proxy
 • <code>/user_data</code> - Download all user subscriptions
-• <code>/user_info &lt;chat_id&gt;</code> - Get specific user info
-• <code>/modify_user &lt;action&gt; &lt;chat_id&gt; &lt;stations&gt;</code> - Modify user data
+• <code>/user_info chat_id</code> - Get specific user info
+• <code>/modify_user action chat_id stations</code> - Modify user subscriptions
 
-<b>Examples:</b> 
+<b>Examples:</b>
 • <code>/subscribe 1057</code>
-• <code>/unsubscribe 1</code> (removes first subscription)
-• <code>/delete_proxy 1</code> (removes first proxy)
+• <code>/unsubscribe 1</code>
+• <code>/update_proxy 192.168.1.1:8080:http</code>
+• <code>/delete_proxy 1</code>
 • <code>/modify_user add 123456789 1057,1058</code>
 
-<b>Limits:</b> Maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions per user.
+<b>Limits:</b>
+• Maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions per user
+• Automatic updates at 16 minutes past every hour (Indian time)
+            """
+        else:
+            help_msg = f"""
+🌦️ <b>Weather Update Bot - Help</b>
 
-You'll receive automatic updates every hour at 16 minutes past the hour (Indian time).
-        """
-        bot.reply_to(message, welcome_msg, parse_mode='HTML')
+<b>Available Commands:</b>
+• <code>/start</code> - Start the bot and see welcome message
+• <code>/help</code> - Show this help message
+• <code>/subscribe number</code> - Subscribe to weather updates for a station
+• <code>/list</code> - View your subscriptions with serial numbers
+• <code>/unsubscribe serial_number</code> - Remove a subscription
+• <code>/rf</code> - Get latest weather data (manual refresh)
+
+<b>Examples:</b>
+• <code>/subscribe 1057</code>
+• <code>/unsubscribe 1</code>
+
+<b>Limits:</b>
+• Maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions per user
+• Automatic updates at 16 minutes past every hour (Indian time)
+            """
+
+        bot.reply_to(message, help_msg, parse_mode='HTML')
+
     except Exception as e:
-        write_log("ERROR", f"Error in /start command: {e}")
+        write_log("ERROR", f"Error in /help command for user {chat_id}: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred. Please try again.")
-        except:
-            pass
+            bot.reply_to(message, "❌ Error occurred while fetching help information.")
+        except Exception as reply_error:
+            write_log("ERROR", f"Failed to send error message for /help command: {reply_error}")
 
 
 # Command: /subscribe <integer> with error handling and subscription limits
@@ -999,7 +1040,8 @@ def unsubscribe(message):
             subscriptions[chat_id] = user_subs
 
         save_subscriptions(subscriptions)
-        write_log("INFO", f"{chat_id} unsubscribed from suffix {suffix_to_remove}")
+        write_log("INFO",
+                  f"{chat_id} unsubscribed from suffix {suffix_to_remove}")
 
         remaining = len(user_subs) if user_subs else 0
         bot.reply_to(
@@ -1196,10 +1238,10 @@ def delete_proxy(message):
         proxies_data = load_proxies()
         active_proxies = proxies_data.get("proxies", [])
         failed_proxies = proxies_data.get("failed", [])
-        
+
         # Combine all proxies for serial numbering
         all_proxies = active_proxies + failed_proxies
-        
+
         if not all_proxies:
             bot.reply_to(
                 message,
@@ -1216,7 +1258,7 @@ def delete_proxy(message):
 
         # Get the proxy at the serial position (subtract 1 for 0-based index)
         proxy_to_remove = all_proxies[serial_num - 1]
-        
+
         # Determine if it's in active or failed list and remove it
         if proxy_to_remove in active_proxies:
             proxies_data["proxies"].remove(proxy_to_remove)
@@ -1224,9 +1266,10 @@ def delete_proxy(message):
         else:
             proxies_data["failed"].remove(proxy_to_remove)
             proxy_type = "failed"
-        
+
         save_proxies(proxies_data)
-        write_log("INFO", f"Owner deleted {proxy_type} proxy: {proxy_to_remove}")
+        write_log("INFO",
+                  f"Owner deleted {proxy_type} proxy: {proxy_to_remove}")
 
         bot.reply_to(
             message,
@@ -1301,7 +1344,7 @@ def proxy_list(message):
             pass
 
 
-# Command: /user_data - Download all user subscriptions (owner only)
+# Command: /user_data - Download all user subscriptions with username (owner only)
 @bot.message_handler(commands=['user_data'])
 def download_user_data(message):
     try:
@@ -1310,32 +1353,52 @@ def download_user_data(message):
             return
 
         subscriptions = load_subscriptions()
-        
+
         if not subscriptions:
-            bot.reply_to(message, "📄 No user subscriptions found.", parse_mode='HTML')
+            bot.reply_to(message,
+                         "📄 No user subscriptions found.",
+                         parse_mode='HTML')
             return
 
         # Create detailed user data report
         report = "👥 USER SUBSCRIPTIONS REPORT\n"
         report += f"📅 Generated: {datetime.now(INDIAN_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S IST')}\n"
         report += "=" * 50 + "\n\n"
-        
+
         total_users = len(subscriptions)
-        total_subscriptions = sum(len(subs) if isinstance(subs, list) else 1 for subs in subscriptions.values())
-        
+        total_subscriptions = sum(
+            len(subs) if isinstance(subs, list) else 1
+            for subs in subscriptions.values())
+
         report += f"📊 SUMMARY:\n"
         report += f"Total Users: {total_users}\n"
         report += f"Total Subscriptions: {total_subscriptions}\n"
         report += f"Average Subscriptions per User: {total_subscriptions/total_users:.2f}\n\n"
-        
+
         report += "👤 USER DETAILS:\n"
         report += "-" * 30 + "\n"
-        
+
         for i, (chat_id, suffixes) in enumerate(subscriptions.items(), 1):
             if isinstance(suffixes, str):
                 suffixes = [suffixes]
-            
+
+            # Try to get user info
+            username = "Unknown"
+            try:
+                user = bot.get_chat(chat_id)
+                if user.username:
+                    username = f"@{user.username}"
+                elif user.first_name:
+                    username = user.first_name
+                    if user.last_name:
+                        username += f" {user.last_name}"
+            except Exception as e:
+                write_log(
+                    "ERROR",
+                    f"Error fetching username for chat_id {chat_id}: {e}")
+
             report += f"{i}. Chat ID: {chat_id}\n"
+            report += f"   Username: {username}\n"
             report += f"   Subscriptions ({len(suffixes)}): {', '.join(suffixes)}\n"
             report += f"   Stations: {' | '.join([f'Station {s}' for s in suffixes])}\n\n"
 
@@ -1343,14 +1406,16 @@ def download_user_data(message):
         temp_filename = f"user_data_{datetime.now(INDIAN_TIMEZONE).strftime('%Y%m%d_%H%M%S')}.txt"
         with open(temp_filename, 'w', encoding='utf-8') as f:
             f.write(report)
-        
+
         try:
             with open(temp_filename, 'rb') as f:
-                bot.send_document(message.chat.id, f, caption="📋 Complete user subscriptions data")
-            
+                bot.send_document(message.chat.id,
+                                  f,
+                                  caption="📋 Complete user subscriptions data")
+
             # Clean up temporary file
             os.remove(temp_filename)
-            
+
         except Exception as e:
             write_log("ERROR", f"Error sending user data file: {e}")
             bot.reply_to(message, "❌ Error sending user data file.")
@@ -1358,7 +1423,8 @@ def download_user_data(message):
     except Exception as e:
         write_log("ERROR", f"Error in /user_data command: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred while generating user data.")
+            bot.reply_to(message,
+                         "❌ Error occurred while generating user data.")
         except:
             pass
 
@@ -1375,11 +1441,11 @@ def modify_user(message):
             parts = message.text.split(' ', 3)
             if len(parts) < 4:
                 raise IndexError
-            
+
             action = parts[1].lower()  # add, remove, or replace
             target_chat_id = parts[2]
             station_ids = parts[3]
-            
+
         except IndexError:
             bot.reply_to(
                 message,
@@ -1395,7 +1461,7 @@ def modify_user(message):
             return
 
         subscriptions = load_subscriptions()
-        
+
         # Initialize user if not exists
         if target_chat_id not in subscriptions:
             subscriptions[target_chat_id] = []
@@ -1403,27 +1469,37 @@ def modify_user(message):
             subscriptions[target_chat_id] = [subscriptions[target_chat_id]]
 
         current_subs = subscriptions[target_chat_id][:]
-        
+
         if action == 'clear':
             subscriptions[target_chat_id] = []
             result_msg = f"✅ <b>User data cleared!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n📊 <b>Previous subscriptions:</b> {len(current_subs)}\n📊 <b>Current subscriptions:</b> 0"
-            
+
         else:
             # Parse station IDs
             try:
-                station_list = [s.strip() for s in station_ids.split(',') if s.strip().isdigit()]
+                station_list = [
+                    s.strip() for s in station_ids.split(',')
+                    if s.strip().isdigit()
+                ]
                 if not station_list:
-                    bot.reply_to(message, "❌ Please provide valid station IDs (numbers only).", parse_mode='HTML')
+                    bot.reply_to(
+                        message,
+                        "❌ Please provide valid station IDs (numbers only).",
+                        parse_mode='HTML')
                     return
             except:
-                bot.reply_to(message, "❌ Invalid station IDs format.", parse_mode='HTML')
+                bot.reply_to(message,
+                             "❌ Invalid station IDs format.",
+                             parse_mode='HTML')
                 return
 
             if action == 'add':
                 for station in station_list:
-                    if station not in subscriptions[target_chat_id] and len(subscriptions[target_chat_id]) < MAX_SUBSCRIPTIONS_PER_USER:
+                    if station not in subscriptions[target_chat_id] and len(
+                            subscriptions[target_chat_id]
+                    ) < MAX_SUBSCRIPTIONS_PER_USER:
                         subscriptions[target_chat_id].append(station)
-                
+
                 result_msg = f"✅ <b>Stations added!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n➕ <b>Added:</b> {', '.join(station_list)}\n📊 <b>Total subscriptions:</b> {len(subscriptions[target_chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}"
 
             elif action == 'remove':
@@ -1432,13 +1508,14 @@ def modify_user(message):
                     if station in subscriptions[target_chat_id]:
                         subscriptions[target_chat_id].remove(station)
                         removed.append(station)
-                
+
                 result_msg = f"✅ <b>Stations removed!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n➖ <b>Removed:</b> {', '.join(removed)}\n📊 <b>Remaining subscriptions:</b> {len(subscriptions[target_chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}"
 
             elif action == 'replace':
                 # Limit to MAX_SUBSCRIPTIONS_PER_USER
-                subscriptions[target_chat_id] = station_list[:MAX_SUBSCRIPTIONS_PER_USER]
-                
+                subscriptions[
+                    target_chat_id] = station_list[:MAX_SUBSCRIPTIONS_PER_USER]
+
                 result_msg = f"✅ <b>Subscriptions replaced!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n🔄 <b>New subscriptions:</b> {', '.join(subscriptions[target_chat_id])}\n📊 <b>Total subscriptions:</b> {len(subscriptions[target_chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}"
 
         # Clean up empty subscription lists
@@ -1446,73 +1523,96 @@ def modify_user(message):
             del subscriptions[target_chat_id]
 
         save_subscriptions(subscriptions)
-        write_log("INFO", f"Owner modified user {target_chat_id} subscriptions: {action}")
-        
+        write_log(
+            "INFO",
+            f"Owner modified user {target_chat_id} subscriptions: {action}")
+
         bot.reply_to(message, result_msg, parse_mode='HTML')
 
     except Exception as e:
         write_log("ERROR", f"Error in /modify_user command: {e}")
         try:
-            bot.reply_to(message, "❌ Error occurred while modifying user data.")
+            bot.reply_to(message,
+                         "❌ Error occurred while modifying user data.")
         except:
             pass
 
-
-# Command: /user_info - Get specific user information (owner only)
-@bot.message_handler(commands=['user_info'])
-def user_info(message):
-    try:
-        if str(message.chat.id) != OWNER_ID:
-            bot.reply_to(message, "❌ Only the owner can access user information.")
-            return
-
+    # Command: /user_info - Get specific user information with username (owner only)
+    @bot.message_handler(commands=['user_info'])
+    def user_info(message):
         try:
-            target_chat_id = message.text.split()[1]
-        except IndexError:
-            bot.reply_to(
-                message,
-                "❌ Please provide a chat ID.\n\n<b>Example:</b> <code>/user_info 123456789</code>",
-                parse_mode='HTML')
-            return
+            if str(message.chat.id) != OWNER_ID:
+                bot.reply_to(message,
+                             "❌ Only the owner can access user information.")
+                return
 
-        subscriptions = load_subscriptions()
-        
-        if target_chat_id not in subscriptions:
-            bot.reply_to(
-                message,
-                f"❌ <b>User not found!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n📊 <b>Status:</b> No subscriptions",
-                parse_mode='HTML')
-            return
+            try:
+                target_chat_id = message.text.split()[1]
+            except IndexError:
+                bot.reply_to(
+                    message,
+                    "❌ Please provide a chat ID.\n\n<b>Example:</b> <code>/user_info 123456789</code>",
+                    parse_mode='HTML')
+                return
 
-        user_subs = subscriptions[target_chat_id]
-        if isinstance(user_subs, str):
-            user_subs = [user_subs]
+            subscriptions = load_subscriptions()
 
-        msg = f"👤 <b>User Information</b>\n\n"
-        msg += f"💬 <b>Chat ID:</b> <code>{target_chat_id}</code>\n"
-        msg += f"📊 <b>Subscriptions:</b> {len(user_subs)}/{MAX_SUBSCRIPTIONS_PER_USER}\n\n"
-        
-        if user_subs:
-            msg += f"🌦️ <b>Subscribed Stations:</b>\n"
-            for i, suffix in enumerate(user_subs, 1):
-                msg += f"{i}. Station <code>{suffix}</code>\n"
-        else:
-            msg += "📭 <b>No active subscriptions</b>\n"
+            if target_chat_id not in subscriptions:
+                bot.reply_to(
+                    message,
+                    f"❌ <b>User not found!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n📊 <b>Status:</b> No subscriptions",
+                    parse_mode='HTML')
+                return
 
-        msg += f"\n💡 <b>Owner Commands:</b>\n"
-        msg += f"• <code>/modify_user add {target_chat_id} 1057,1058</code>\n"
-        msg += f"• <code>/modify_user remove {target_chat_id} 1057</code>\n"
-        msg += f"• <code>/modify_user replace {target_chat_id} 1059</code>\n"
-        msg += f"• <code>/modify_user clear {target_chat_id}</code>"
+            user_subs = subscriptions[target_chat_id]
+            if isinstance(user_subs, str):
+                user_subs = [user_subs]
 
-        bot.reply_to(message, msg, parse_mode='HTML')
+            # Get username
+            username = "Unknown"
+            try:
+                user = bot.get_chat(target_chat_id)
+                if user.username:
+                    username = f"@{user.username}"
+                elif user.first_name:
+                    username = user.first_name
+                    if user.last_name:
+                        username += f" {user.last_name}"
+                # Note: At least one of these fields is guaranteed to be filled out
+            except Exception as e:
+                write_log(
+                    "ERROR",
+                    f"Error fetching username for chat_id {target_chat_id}: {e}"
+                )
 
-    except Exception as e:
-        write_log("ERROR", f"Error in /user_info command: {e}")
-        try:
-            bot.reply_to(message, "❌ Error occurred while fetching user information.")
-        except:
-            pass
+            msg = f"👤 <b>User Information</b>\n\n"
+            msg += f"💬 <b>Chat ID:</b> <code>{target_chat_id}</code>\n"
+            msg += f"👤 <b>Username:</b> {username}\n"
+            msg += f"📊 <b>Subscriptions:</b> {len(user_subs)}/{MAX_SUBSCRIPTIONS_PER_USER}\n\n"
+
+            if user_subs:
+                msg += f"🌦️ <b>Subscribed Stations:</b>\n"
+                for i, suffix in enumerate(user_subs, 1):
+                    msg += f"{i}. Station <code>{suffix}</code>\n"
+            else:
+                msg += "📭 <b>No active subscriptions</b>\n"
+
+            msg += f"\n💡 <b>Owner Commands:</b>\n"
+            msg += f"• <code>/modify_user add {target_chat_id} 1057,1058</code>\n"
+            msg += f"• <code>/modify_user remove {target_chat_id} 1057</code>\n"
+            msg += f"• <code>/modify_user replace {target_chat_id} 1059</code>\n"
+            msg += f"• <code>/modify_user clear {target_chat_id}</code>"
+
+            bot.reply_to(message, msg, parse_mode='HTML')
+
+        except Exception as e:
+            write_log("ERROR", f"Error in /user_info command: {e}")
+            try:
+                bot.reply_to(
+                    message,
+                    "❌ Error occurred while fetching user information.")
+            except:
+                pass
 
 
 # Start the bot with infinite polling and comprehensive error handling
@@ -1535,7 +1635,9 @@ if __name__ == "__main__":
         # Initialize MongoDB connection
         if not init_mongodb():
             write_log("CRITICAL", "Failed to initialize MongoDB. Exiting...")
-            print("Failed to connect to MongoDB. Please check your MONGO_URI environment variable.")
+            print(
+                "Failed to connect to MongoDB. Please check your MONGO_URI environment variable."
+            )
             exit(1)
 
         # Start Indian time checker in a background thread
