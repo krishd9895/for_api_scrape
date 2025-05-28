@@ -739,7 +739,7 @@ def run_indian_time_checker():
 
 
 # Command: /start with error handling
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['help'])
 def send_welcome(message):
     try:
         welcome_msg = f"""
@@ -747,20 +747,24 @@ def send_welcome(message):
 
 <b>Available Commands:</b>
 • <code>/subscribe &lt;number&gt;</code> - Subscribe to weather updates
-• <code>/list</code> - View your subscriptions
-• <code>/unsubscribe &lt;number&gt;</code> - Remove a subscription
+• <code>/list</code> - View your subscriptions with serial numbers
+• <code>/unsubscribe &lt;serial_number&gt;</code> - Remove a subscription
 • <code>/rf</code> - Get latest weather data (manual refresh)
-• <code>/logs</code> - View logs (owner only)
 
-<b>Proxy Management (Owner Only):</b>
-• <code>/proxy_list</code> - View all proxies
+<b>Owner Commands:</b>
+• <code>/logs</code> - View logs
+• <code>/proxy_list</code> - View all proxies with serial numbers
 • <code>/update_proxy ip:port:protocol</code> - Add new proxy
-• <code>/delete_proxy ip:port:protocol</code> - Remove proxy
+• <code>/delete_proxy &lt;serial_number&gt;</code> - Remove proxy
+• <code>/user_data</code> - Download all user subscriptions
+• <code>/user_info &lt;chat_id&gt;</code> - Get specific user info
+• <code>/modify_user &lt;action&gt; &lt;chat_id&gt; &lt;stations&gt;</code> - Modify user data
 
 <b>Examples:</b> 
 • <code>/subscribe 1057</code>
-• <code>/unsubscribe 1057</code>
-• <code>/update_proxy 192.168.1.1:8080:http</code>
+• <code>/unsubscribe 1</code> (removes first subscription)
+• <code>/delete_proxy 1</code> (removes first proxy)
+• <code>/modify_user add 123456789 1057,1058</code>
 
 <b>Limits:</b> Maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions per user.
 
@@ -927,7 +931,7 @@ def list_subscriptions(message):
         for i, suffix in enumerate(user_subs, 1):
             msg += f"{i}. Station <code>{suffix}</code>\n"
 
-        msg += f"\n💡 Use <code>/unsubscribe &lt;number&gt;</code> to remove a subscription."
+        msg += f"\n💡 Use <code>/unsubscribe &lt;serial_number&gt;</code> to remove a subscription."
 
         bot.reply_to(message, msg, parse_mode='HTML')
 
@@ -940,23 +944,24 @@ def list_subscriptions(message):
             pass
 
 
-# Command: /unsubscribe <integer> - Remove a subscription
+# Command: /unsubscribe <serial_number> - Remove a subscription by serial number
 @bot.message_handler(commands=['unsubscribe'])
 def unsubscribe(message):
     chat_id = str(message.chat.id)
     try:
         try:
-            suffix = message.text.split()[1]
-            if not suffix.isdigit():
+            serial_num = message.text.split()[1]
+            if not serial_num.isdigit():
                 bot.reply_to(
                     message,
-                    "❌ Please provide a valid integer suffix.\n\n<b>Example:</b> <code>/unsubscribe 1057</code>",
+                    "❌ Please provide a valid serial number.\n\n<b>Example:</b> <code>/unsubscribe 1</code>\n\nUse <code>/list</code> to see your subscriptions with serial numbers.",
                     parse_mode='HTML')
                 return
+            serial_num = int(serial_num)
         except IndexError:
             bot.reply_to(
                 message,
-                "❌ Please provide an integer suffix.\n\n<b>Example:</b> <code>/unsubscribe 1057</code>",
+                "❌ Please provide a serial number.\n\n<b>Example:</b> <code>/unsubscribe 1</code>\n\nUse <code>/list</code> to see your subscriptions with serial numbers.",
                 parse_mode='HTML')
             return
 
@@ -974,15 +979,18 @@ def unsubscribe(message):
             user_subs = [user_subs]
             subscriptions[chat_id] = user_subs
 
-        if suffix not in user_subs:
+        if serial_num < 1 or serial_num > len(user_subs):
             bot.reply_to(
                 message,
-                f"❌ You are not subscribed to station <b>{suffix}</b>.\n\nUse <code>/list</code> to view your subscriptions.",
+                f"❌ Invalid serial number. Please choose between 1 and {len(user_subs)}.\n\nUse <code>/list</code> to view your subscriptions.",
                 parse_mode='HTML')
             return
 
+        # Get the suffix at the serial position (subtract 1 for 0-based index)
+        suffix_to_remove = user_subs[serial_num - 1]
+
         # Remove subscription
-        user_subs.remove(suffix)
+        user_subs.remove(suffix_to_remove)
 
         # Clean up empty subscription lists
         if not user_subs:
@@ -991,12 +999,12 @@ def unsubscribe(message):
             subscriptions[chat_id] = user_subs
 
         save_subscriptions(subscriptions)
-        write_log("INFO", f"{chat_id} unsubscribed from suffix {suffix}")
+        write_log("INFO", f"{chat_id} unsubscribed from suffix {suffix_to_remove}")
 
         remaining = len(user_subs) if user_subs else 0
         bot.reply_to(
             message,
-            f"✅ <b>Successfully unsubscribed!</b>\n\n📡 <b>Removed station:</b> {suffix}\n📊 <b>Remaining subscriptions:</b> {remaining}/{MAX_SUBSCRIPTIONS_PER_USER}",
+            f"✅ <b>Successfully unsubscribed!</b>\n\n📡 <b>Removed station:</b> {suffix_to_remove} (Serial #{serial_num})\n📊 <b>Remaining subscriptions:</b> {remaining}/{MAX_SUBSCRIPTIONS_PER_USER}",
             parse_mode='HTML')
 
     except Exception as e:
@@ -1161,7 +1169,7 @@ def update_proxy(message):
             pass
 
 
-# Command: /delete_proxy - Remove proxy (owner only)
+# Command: /delete_proxy - Remove proxy by serial number (owner only)
 @bot.message_handler(commands=['delete_proxy'])
 def delete_proxy(message):
     try:
@@ -1170,46 +1178,59 @@ def delete_proxy(message):
             return
 
         try:
-            proxy_entry = message.text.split(' ', 1)[1].strip()
-            if not proxy_entry:
-                raise IndexError
+            serial_num = message.text.split()[1]
+            if not serial_num.isdigit():
+                bot.reply_to(
+                    message,
+                    "❌ Please provide a valid serial number.\n\n<b>Example:</b> <code>/delete_proxy 1</code>\n\nUse <code>/proxy_list</code> to see proxies with serial numbers.",
+                    parse_mode='HTML')
+                return
+            serial_num = int(serial_num)
         except IndexError:
             bot.reply_to(
                 message,
-                "❌ Please provide proxy to delete in format: <code>ip:port:protocol</code>\n\n<b>Example:</b> <code>/delete_proxy 192.168.1.1:8080:http</code>",
+                "❌ Please provide a serial number.\n\n<b>Example:</b> <code>/delete_proxy 1</code>\n\nUse <code>/proxy_list</code> to see proxies with serial numbers.",
                 parse_mode='HTML')
             return
 
         proxies_data = load_proxies()
-
-        # Check if proxy exists in active list
-        if proxy_entry in proxies_data.get("proxies", []):
-            proxies_data["proxies"].remove(proxy_entry)
-            save_proxies(proxies_data)
-            write_log("INFO", f"Owner deleted proxy: {proxy_entry}")
-
+        active_proxies = proxies_data.get("proxies", [])
+        failed_proxies = proxies_data.get("failed", [])
+        
+        # Combine all proxies for serial numbering
+        all_proxies = active_proxies + failed_proxies
+        
+        if not all_proxies:
             bot.reply_to(
                 message,
-                f"✅ <b>Proxy deleted successfully!</b>\n\n📡 <b>Removed:</b> <code>{proxy_entry}</code>\n📊 <b>Remaining proxies:</b> {len(proxies_data.get('proxies', []))}",
+                "❌ No proxies available to delete.\n\nUse <code>/update_proxy</code> to add proxies first.",
                 parse_mode='HTML')
             return
 
-        # Check if proxy exists in failed list
-        if proxy_entry in proxies_data.get("failed", []):
-            proxies_data["failed"].remove(proxy_entry)
-            save_proxies(proxies_data)
-            write_log("INFO", f"Owner deleted failed proxy: {proxy_entry}")
-
+        if serial_num < 1 or serial_num > len(all_proxies):
             bot.reply_to(
                 message,
-                f"✅ <b>Failed proxy deleted successfully!</b>\n\n📡 <b>Removed:</b> <code>{proxy_entry}</code>",
+                f"❌ Invalid serial number. Please choose between 1 and {len(all_proxies)}.\n\nUse <code>/proxy_list</code> to see available proxies.",
                 parse_mode='HTML')
             return
 
-        # Proxy not found
+        # Get the proxy at the serial position (subtract 1 for 0-based index)
+        proxy_to_remove = all_proxies[serial_num - 1]
+        
+        # Determine if it's in active or failed list and remove it
+        if proxy_to_remove in active_proxies:
+            proxies_data["proxies"].remove(proxy_to_remove)
+            proxy_type = "active"
+        else:
+            proxies_data["failed"].remove(proxy_to_remove)
+            proxy_type = "failed"
+        
+        save_proxies(proxies_data)
+        write_log("INFO", f"Owner deleted {proxy_type} proxy: {proxy_to_remove}")
+
         bot.reply_to(
             message,
-            f"❌ <b>Proxy not found!</b>\n\n📡 <b>Proxy:</b> <code>{proxy_entry}</code>\n\nUse <code>/proxy_list</code> to see available proxies.",
+            f"✅ <b>{proxy_type.title()} proxy deleted successfully!</b>\n\n📡 <b>Removed:</b> <code>{proxy_to_remove}</code> (Serial #{serial_num})\n📊 <b>Remaining active proxies:</b> {len(proxies_data.get('proxies', []))}\n📊 <b>Remaining failed proxies:</b> {len(proxies_data.get('failed', []))}",
             parse_mode='HTML')
 
     except Exception as e:
@@ -1222,7 +1243,7 @@ def delete_proxy(message):
             pass
 
 
-# Command: /proxy_list - List all proxies with protocols (owner only)
+# Command: /proxy_list - List all proxies with protocols and serial numbers (owner only)
 @bot.message_handler(commands=['proxy_list'])
 def proxy_list(message):
     try:
@@ -1235,34 +1256,37 @@ def proxy_list(message):
         failed_proxies = proxies_data.get("failed", [])
 
         msg = "🔗 <b>Proxy Configuration</b>\n\n"
+        serial_counter = 1
 
-        # Active proxies
+        # Active proxies with serial numbers
         if active_proxies:
             msg += f"✅ <b>Active Proxies ({len(active_proxies)}):</b>\n"
-            for i, proxy in enumerate(active_proxies, 1):
+            for proxy in active_proxies:
                 try:
                     ip_port, protocol = proxy.rsplit(':', 1)
-                    msg += f"{i}. <code>{ip_port}</code> ({protocol.upper()})\n"
+                    msg += f"{serial_counter}. <code>{ip_port}</code> ({protocol.upper()})\n"
                 except:
-                    msg += f"{i}. <code>{proxy}</code> (Invalid format)\n"
+                    msg += f"{serial_counter}. <code>{proxy}</code> (Invalid format)\n"
+                serial_counter += 1
         else:
             msg += "✅ <b>Active Proxies:</b> None\n"
 
         msg += "\n"
 
-        # Failed proxies
+        # Failed proxies with serial numbers
         if failed_proxies:
             msg += f"❌ <b>Failed Proxies ({len(failed_proxies)}):</b>\n"
-            for i, proxy in enumerate(failed_proxies, 1):
+            for proxy in failed_proxies:
                 try:
                     ip_port, protocol = proxy.rsplit(':', 1)
-                    msg += f"{i}. <code>{ip_port}</code> ({protocol.upper()})\n"
+                    msg += f"{serial_counter}. <code>{ip_port}</code> ({protocol.upper()})\n"
                 except:
-                    msg += f"{i}. <code>{proxy}</code> (Invalid format)\n"
+                    msg += f"{serial_counter}. <code>{proxy}</code> (Invalid format)\n"
+                serial_counter += 1
         else:
             msg += "❌ <b>Failed Proxies:</b> None\n"
 
-        msg += f"\n💡 <b>Commands:</b>\n• <code>/update_proxy ip:port:protocol</code>\n• <code>/delete_proxy ip:port:protocol</code>"
+        msg += f"\n💡 <b>Commands:</b>\n• <code>/update_proxy ip:port:protocol</code>\n• <code>/delete_proxy &lt;serial_number&gt;</code>"
 
         bot.reply_to(message, msg, parse_mode='HTML')
 
@@ -1273,6 +1297,220 @@ def proxy_list(message):
                 message,
                 "❌ Error occurred while fetching proxy list. Please try again."
             )
+        except:
+            pass
+
+
+# Command: /user_data - Download all user subscriptions (owner only)
+@bot.message_handler(commands=['user_data'])
+def download_user_data(message):
+    try:
+        if str(message.chat.id) != OWNER_ID:
+            bot.reply_to(message, "❌ Only the owner can access user data.")
+            return
+
+        subscriptions = load_subscriptions()
+        
+        if not subscriptions:
+            bot.reply_to(message, "📄 No user subscriptions found.", parse_mode='HTML')
+            return
+
+        # Create detailed user data report
+        report = "👥 USER SUBSCRIPTIONS REPORT\n"
+        report += f"📅 Generated: {datetime.now(INDIAN_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S IST')}\n"
+        report += "=" * 50 + "\n\n"
+        
+        total_users = len(subscriptions)
+        total_subscriptions = sum(len(subs) if isinstance(subs, list) else 1 for subs in subscriptions.values())
+        
+        report += f"📊 SUMMARY:\n"
+        report += f"Total Users: {total_users}\n"
+        report += f"Total Subscriptions: {total_subscriptions}\n"
+        report += f"Average Subscriptions per User: {total_subscriptions/total_users:.2f}\n\n"
+        
+        report += "👤 USER DETAILS:\n"
+        report += "-" * 30 + "\n"
+        
+        for i, (chat_id, suffixes) in enumerate(subscriptions.items(), 1):
+            if isinstance(suffixes, str):
+                suffixes = [suffixes]
+            
+            report += f"{i}. Chat ID: {chat_id}\n"
+            report += f"   Subscriptions ({len(suffixes)}): {', '.join(suffixes)}\n"
+            report += f"   Stations: {' | '.join([f'Station {s}' for s in suffixes])}\n\n"
+
+        # Save to temporary file and send
+        temp_filename = f"user_data_{datetime.now(INDIAN_TIMEZONE).strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(temp_filename, 'w', encoding='utf-8') as f:
+            f.write(report)
+        
+        try:
+            with open(temp_filename, 'rb') as f:
+                bot.send_document(message.chat.id, f, caption="📋 Complete user subscriptions data")
+            
+            # Clean up temporary file
+            os.remove(temp_filename)
+            
+        except Exception as e:
+            write_log("ERROR", f"Error sending user data file: {e}")
+            bot.reply_to(message, "❌ Error sending user data file.")
+
+    except Exception as e:
+        write_log("ERROR", f"Error in /user_data command: {e}")
+        try:
+            bot.reply_to(message, "❌ Error occurred while generating user data.")
+        except:
+            pass
+
+
+# Command: /modify_user - Modify user subscriptions (owner only)
+@bot.message_handler(commands=['modify_user'])
+def modify_user(message):
+    try:
+        if str(message.chat.id) != OWNER_ID:
+            bot.reply_to(message, "❌ Only the owner can modify user data.")
+            return
+
+        try:
+            parts = message.text.split(' ', 3)
+            if len(parts) < 4:
+                raise IndexError
+            
+            action = parts[1].lower()  # add, remove, or replace
+            target_chat_id = parts[2]
+            station_ids = parts[3]
+            
+        except IndexError:
+            bot.reply_to(
+                message,
+                "❌ Invalid format. Use:\n\n<b>Examples:</b>\n• <code>/modify_user add 123456789 1057,1058</code>\n• <code>/modify_user remove 123456789 1057</code>\n• <code>/modify_user replace 123456789 1059,1060</code>\n• <code>/modify_user clear 123456789</code>",
+                parse_mode='HTML')
+            return
+
+        if action not in ['add', 'remove', 'replace', 'clear']:
+            bot.reply_to(
+                message,
+                "❌ Invalid action. Use: <code>add</code>, <code>remove</code>, <code>replace</code>, or <code>clear</code>",
+                parse_mode='HTML')
+            return
+
+        subscriptions = load_subscriptions()
+        
+        # Initialize user if not exists
+        if target_chat_id not in subscriptions:
+            subscriptions[target_chat_id] = []
+        elif isinstance(subscriptions[target_chat_id], str):
+            subscriptions[target_chat_id] = [subscriptions[target_chat_id]]
+
+        current_subs = subscriptions[target_chat_id][:]
+        
+        if action == 'clear':
+            subscriptions[target_chat_id] = []
+            result_msg = f"✅ <b>User data cleared!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n📊 <b>Previous subscriptions:</b> {len(current_subs)}\n📊 <b>Current subscriptions:</b> 0"
+            
+        else:
+            # Parse station IDs
+            try:
+                station_list = [s.strip() for s in station_ids.split(',') if s.strip().isdigit()]
+                if not station_list:
+                    bot.reply_to(message, "❌ Please provide valid station IDs (numbers only).", parse_mode='HTML')
+                    return
+            except:
+                bot.reply_to(message, "❌ Invalid station IDs format.", parse_mode='HTML')
+                return
+
+            if action == 'add':
+                for station in station_list:
+                    if station not in subscriptions[target_chat_id] and len(subscriptions[target_chat_id]) < MAX_SUBSCRIPTIONS_PER_USER:
+                        subscriptions[target_chat_id].append(station)
+                
+                result_msg = f"✅ <b>Stations added!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n➕ <b>Added:</b> {', '.join(station_list)}\n📊 <b>Total subscriptions:</b> {len(subscriptions[target_chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}"
+
+            elif action == 'remove':
+                removed = []
+                for station in station_list:
+                    if station in subscriptions[target_chat_id]:
+                        subscriptions[target_chat_id].remove(station)
+                        removed.append(station)
+                
+                result_msg = f"✅ <b>Stations removed!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n➖ <b>Removed:</b> {', '.join(removed)}\n📊 <b>Remaining subscriptions:</b> {len(subscriptions[target_chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}"
+
+            elif action == 'replace':
+                # Limit to MAX_SUBSCRIPTIONS_PER_USER
+                subscriptions[target_chat_id] = station_list[:MAX_SUBSCRIPTIONS_PER_USER]
+                
+                result_msg = f"✅ <b>Subscriptions replaced!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n🔄 <b>New subscriptions:</b> {', '.join(subscriptions[target_chat_id])}\n📊 <b>Total subscriptions:</b> {len(subscriptions[target_chat_id])}/{MAX_SUBSCRIPTIONS_PER_USER}"
+
+        # Clean up empty subscription lists
+        if not subscriptions[target_chat_id]:
+            del subscriptions[target_chat_id]
+
+        save_subscriptions(subscriptions)
+        write_log("INFO", f"Owner modified user {target_chat_id} subscriptions: {action}")
+        
+        bot.reply_to(message, result_msg, parse_mode='HTML')
+
+    except Exception as e:
+        write_log("ERROR", f"Error in /modify_user command: {e}")
+        try:
+            bot.reply_to(message, "❌ Error occurred while modifying user data.")
+        except:
+            pass
+
+
+# Command: /user_info - Get specific user information (owner only)
+@bot.message_handler(commands=['user_info'])
+def user_info(message):
+    try:
+        if str(message.chat.id) != OWNER_ID:
+            bot.reply_to(message, "❌ Only the owner can access user information.")
+            return
+
+        try:
+            target_chat_id = message.text.split()[1]
+        except IndexError:
+            bot.reply_to(
+                message,
+                "❌ Please provide a chat ID.\n\n<b>Example:</b> <code>/user_info 123456789</code>",
+                parse_mode='HTML')
+            return
+
+        subscriptions = load_subscriptions()
+        
+        if target_chat_id not in subscriptions:
+            bot.reply_to(
+                message,
+                f"❌ <b>User not found!</b>\n\n👤 <b>Chat ID:</b> {target_chat_id}\n📊 <b>Status:</b> No subscriptions",
+                parse_mode='HTML')
+            return
+
+        user_subs = subscriptions[target_chat_id]
+        if isinstance(user_subs, str):
+            user_subs = [user_subs]
+
+        msg = f"👤 <b>User Information</b>\n\n"
+        msg += f"💬 <b>Chat ID:</b> <code>{target_chat_id}</code>\n"
+        msg += f"📊 <b>Subscriptions:</b> {len(user_subs)}/{MAX_SUBSCRIPTIONS_PER_USER}\n\n"
+        
+        if user_subs:
+            msg += f"🌦️ <b>Subscribed Stations:</b>\n"
+            for i, suffix in enumerate(user_subs, 1):
+                msg += f"{i}. Station <code>{suffix}</code>\n"
+        else:
+            msg += "📭 <b>No active subscriptions</b>\n"
+
+        msg += f"\n💡 <b>Owner Commands:</b>\n"
+        msg += f"• <code>/modify_user add {target_chat_id} 1057,1058</code>\n"
+        msg += f"• <code>/modify_user remove {target_chat_id} 1057</code>\n"
+        msg += f"• <code>/modify_user replace {target_chat_id} 1059</code>\n"
+        msg += f"• <code>/modify_user clear {target_chat_id}</code>"
+
+        bot.reply_to(message, msg, parse_mode='HTML')
+
+    except Exception as e:
+        write_log("ERROR", f"Error in /user_info command: {e}")
+        try:
+            bot.reply_to(message, "❌ Error occurred while fetching user information.")
         except:
             pass
 
