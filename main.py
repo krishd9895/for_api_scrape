@@ -257,7 +257,7 @@ def match_field_type(key):
 
     # Mandal/Area matching
     if any(word in key_lower
-           for word in ['mandal', 'area', 'district', 'region']):
+           for word in ['mandal', 'area']):
         return 'mandal', '🏘️'
 
     # Last Updated matching - Check for "updated" or "last" specifically first
@@ -275,16 +275,16 @@ def match_field_type(key):
 
     # Rainfall matching
     if any(word in key_lower
-           for word in ['rainfall', 'rain', 'precipitation']):
+           for word in ['rainfall', 'rain']):
         return 'rainfall', '🌧️'
 
     # Temperature matching
     if any(word in key_lower
-           for word in ['temperature', 'temp', 'celsius', 'fahrenheit']):
+           for word in ['temperature', 'temp']):
         return 'temperature', '🌡️'
 
     # Humidity matching
-    if any(word in key_lower for word in ['humidity', 'moisture', 'rh']):
+    if any(word in key_lower for word in ['humidity', 'rh']):
         return 'humidity', '💧'
 
     # Wind matching
