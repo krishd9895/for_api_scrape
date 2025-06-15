@@ -55,21 +55,7 @@ MAX_SUBSCRIPTIONS_PER_USER = 4
 # Indian timezone (UTC+5:30)
 INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
-
-# Enhanced logging function with error handling
-def write_log(level, message):
-    try:
-        # Use Indian timezone for logging
-        timestamp = datetime.now(INDIAN_TIMEZONE).strftime(
-            "%Y-%m-%d %H:%M:%S IST")
-        with open(LOG_FILE, "a", encoding='utf-8') as f:
-            f.write(f"{timestamp} - {level.upper()} - {message}\n")
-    except Exception as e:
-        # If logging fails, print to console as fallback
-        print(
-            f"LOG ERROR: {e} | Original message: {level.upper()} - {message}")
-
-
+MAX_LOG_LINES = 4000
 # Function to delete previous checking time log and append new one at the end
 def replace_last_checking_log(message):
     try:
@@ -658,7 +644,6 @@ def check_proxies_and_fetch(url,
     return False
 
 
-# Check Indian time and run automatic updates
 def check_indian_time_and_update():
     try:
         # Get current time in Indian timezone
@@ -703,15 +688,15 @@ def check_indian_time_and_update():
                         time.sleep(
                             1)  # Small delay between multiple subscriptions
 
-                    # Retry failed subscriptions at 17th minute
+                    # Retry failed subscriptions at 17th, 18th, or 19th minute
                     if all_failed:
                         write_log(
                             "INFO",
-                            "All proxies and direct connection failed at 16 minutes, checking at 17 minutes"
+                            "All proxies and direct connection failed at 16 minutes, checking at 17, 18, or 19 minutes"
                         )
-                        time.sleep(60)  # Wait for 17th minute
+                        time.sleep(60)  # Wait for the next minute
                         indian_time = datetime.now(INDIAN_TIMEZONE)
-                        if indian_time.minute == 17:
+                        if indian_time.minute in [17, 18, 19]:
                             for suffix in suffixes:
                                 url = f"{URL_PREFIX}{suffix}"
                                 check_proxies_and_fetch(url,
@@ -721,7 +706,7 @@ def check_indian_time_and_update():
                         else:
                             write_log(
                                 "INFO",
-                                "It is not 17 minute anymore, skipping the retry"
+                                "It is not 17, 18, or 19 minute anymore, skipping the retry"
                             )
 
                 except Exception as e:
