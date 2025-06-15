@@ -465,9 +465,8 @@ def check_proxies_and_fetch(url,
     # Check if proxies data is valid
     if not proxies_data or "proxies" not in proxies_data or not isinstance(
             proxies_data["proxies"], list):
-        error_msg = "❌ Proxies configuration is invalid or empty."
-        write_log("ERROR",
-                  "Proxies configuration is empty or invalid structure")
+        error_msg = "Proxies configuration is invalid or empty."
+        write_log("ERROR", "Proxies configuration is empty or invalid structure")
 
         if str(chat_id) != OWNER_ID:
             bot.send_message(
@@ -497,14 +496,11 @@ def check_proxies_and_fetch(url,
             return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
-            final_error = f"❌ All connection methods failed.\n\nDirect request error: {error}"
-            if message_id:
-                try:
-                    bot.edit_message_text(final_error, chat_id, message_id)
-                except Exception as e:
-                    bot.send_message(chat_id, final_error)
-            else:
-                bot.send_message(chat_id, final_error)
+            if str(chat_id) != OWNER_ID:
+                bot.send_message(
+                    OWNER_ID,
+                    f"🚨 All connection methods failed for user {chat_id}.\nDirect request error: {error}"
+                )
             return False
 
     proxies = proxies_data["proxies"]
@@ -519,7 +515,7 @@ def check_proxies_and_fetch(url,
 
     # Check if there are any proxies to use
     if not proxies:
-        error_msg = "❌ No proxies available in configuration."
+        error_msg = "No proxies available in configuration."
         write_log("ERROR", "Proxies list is empty")
 
         if str(chat_id) != OWNER_ID:
@@ -550,14 +546,11 @@ def check_proxies_and_fetch(url,
             return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
-            final_error = f"❌ All connection methods failed.\n\nDirect request error: {error}"
-            if message_id:
-                try:
-                    bot.edit_message_text(final_error, chat_id, message_id)
-                except Exception as e:
-                    bot.send_message(chat_id, final_error)
-            else:
-                bot.send_message(chat_id, final_error)
+            if str(chat_id) != OWNER_ID:
+                bot.send_message(
+                    OWNER_ID,
+                    f"🚨 All connection methods failed for user {chat_id}.\nDirect request error: {error}"
+                )
             return False
 
     # Try each proxy
@@ -632,14 +625,11 @@ def check_proxies_and_fetch(url,
             return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
-            final_error = f"❌ All proxies and direct connection failed.\n\nLast error: {error}"
-            if message_id:
-                try:
-                    bot.edit_message_text(final_error, chat_id, message_id)
-                except Exception as e:
-                    bot.send_message(chat_id, final_error)
-            else:
-                bot.send_message(chat_id, final_error)
+            if str(chat_id) != OWNER_ID:
+                bot.send_message(
+                    OWNER_ID,
+                    f"🚨 All proxies and direct connection failed for user {chat_id}.\nLast error: {error}"
+                )
             return False
     return False
 
