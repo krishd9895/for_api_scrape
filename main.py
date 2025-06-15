@@ -56,6 +56,7 @@ MAX_SUBSCRIPTIONS_PER_USER = 4
 INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 MAX_LOG_LINES = 4000
+
 # Function to delete previous checking time log and append new one at the end
 def replace_last_checking_log(message):
     try:
