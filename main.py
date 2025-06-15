@@ -57,6 +57,31 @@ INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 MAX_LOG_LINES = 4000
 
+# Enhanced logging function with error handling
+def write_log(level, message):
+    try:
+        # Use Indian timezone for timestamp
+        timestamp = datetime.now(INDIAN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S IST")
+        log_entry = f"{timestamp} - {level.upper()} - {message}\n"
+
+        lines = []
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+        # Append the new log entry
+        lines.append(log_entry)
+
+        # Keep only the last MAX_LOG_LINES lines
+        if len(lines) > MAX_LOG_LINES:
+            lines = lines[-MAX_LOG_LINES:]
+
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+    except Exception as e:
+        print(f"LOG ERROR: {e} | Original message: {level.upper()} - {message}")
+
 # Function to delete previous checking time log and append new one at the end
 def replace_last_checking_log(message):
     try:
