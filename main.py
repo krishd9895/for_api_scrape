@@ -766,16 +766,16 @@ def send_help(message):
 <b>User Commands:</b>
 • <code>/start</code> - Start the bot and see welcome message
 • <code>/help</code> - Show this help message
-• <code>/subscribe number</code> - Subscribe to weather updates for a station
+• <code>/subscribe</code> number - Subscribe to weather updates for a station
 • <code>/list</code> - View your subscriptions with serial numbers
-• <code>/unsubscribe serial_number</code> - Remove a subscription
+• <code>/unsubscribe</code> serial_number  - Remove a subscription
 • <code>/rf</code> - Get latest weather data (manual refresh)
 
 <b>Owner Commands:</b>
 • <code>/logs</code> - Download bot logs
 • <code>/proxy_list</code> - View all proxies with serial numbers
-• <code>/update_proxy ip:port:protocol</code> - Add a new proxy
-• <code>/delete_proxy serial_number</code> - Remove a proxy
+• <code>/update_proxy</code> ip:port:protocol - Add a new proxy
+• <code>/delete_proxy</code> serial_number - Remove a proxy
 • <code>/user_data</code> - Download all user subscriptions
 • <code>/user_info chat_id</code> - Get specific user info
 • <code>/modify_user action chat_id stations</code> - Modify user subscriptions
@@ -800,12 +800,12 @@ def send_help(message):
 • <code>/help</code> - Show this help message
 • <code>/subscribe number</code> - Subscribe to weather updates for a station
 • <code>/list</code> - View your subscriptions with serial numbers
-• <code>/unsubscribe serial_number</code> - Remove a subscription
+• <code>/unsubscribe</code> serial_number - Remove a subscription
 • <code>/rf</code> - Get latest weather data (manual refresh)
 
 <b>Examples:</b>
-• <code>/subscribe 1057</code>
-• <code>/unsubscribe 1</code>
+• <code>/subscribe</code>  1057
+• <code>/unsubscribe</code>  1
 
 <b>Limits:</b>
 • Maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions per user
