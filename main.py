@@ -704,15 +704,15 @@ def check_indian_time_and_update():
                         time.sleep(
                             1)  # Small delay between multiple subscriptions
 
-                    # Retry failed subscriptions at 17th, 18th, or 19th minute
+                    # Retry failed subscriptions at 17th, 18th, 19th or 20th minute
                     if all_failed:
                         write_log(
                             "INFO",
-                            "All proxies and direct connection failed at 16 minutes, checking at 17, 18, or 19 minutes"
+                            "All proxies and direct connection failed at 16 minutes, checking at 17, 18, 19 or 20 minutes"
                         )
                         time.sleep(60)  # Wait for the next minute
                         indian_time = datetime.now(INDIAN_TIMEZONE)
-                        if indian_time.minute in [17, 18, 19]:
+                        if indian_time.minute in [17, 18, 19, 20]:
                             for suffix in suffixes:
                                 url = f"{URL_PREFIX}{suffix}"
                                 check_proxies_and_fetch(url,
@@ -722,7 +722,7 @@ def check_indian_time_and_update():
                         else:
                             write_log(
                                 "INFO",
-                                "It is not 17, 18, or 19 minute anymore, skipping the retry"
+                                "It is not 17, 18, 19 or 20 minute anymore, skipping the retry"
                             )
 
                 except Exception as e:
