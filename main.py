@@ -525,7 +525,7 @@ def check_proxies_and_fetch(url,
             if str(chat_id) != OWNER_ID:
                 bot.send_message(
                     OWNER_ID,
-                    f"🚨 All connection methods failed for user {chat_id}.\nDirect request error: {error}"
+                    f"🚨 All connection methods failed for user {chat_id}.\nDirect request error"
                 )
             return False
 
@@ -575,7 +575,7 @@ def check_proxies_and_fetch(url,
             if str(chat_id) != OWNER_ID:
                 bot.send_message(
                     OWNER_ID,
-                    f"🚨 All connection methods failed for user {chat_id}.\nDirect request error: {error}"
+                    f"🚨 All connection methods failed for user {chat_id}.\nDirect request error"
                 )
             return False
 
@@ -654,7 +654,7 @@ def check_proxies_and_fetch(url,
             if str(chat_id) != OWNER_ID:
                 bot.send_message(
                     OWNER_ID,
-                    f"🚨 All proxies and direct connection failed for user {chat_id}.\nLast error: {error}"
+                    f"🚨 All proxies and direct connection failed for user {chat_id}.\nLast error"
                 )
             return False
     return False
