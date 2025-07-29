@@ -4,6 +4,8 @@ import telebot
 from datetime import timezone, timedelta
 import time
 import threading
+import asyncio
+import aiohttp
 from requests.exceptions import RequestException, ProxyError, ConnectTimeout
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -54,6 +56,9 @@ MAX_SUBSCRIPTIONS_PER_USER = 4
 
 # Indian timezone (UTC+5:30)
 INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+
+TARGET_MINUTE = 16
+RETRY_MINUTES = [17, 18, 19, 20]
 
 MAX_LOG_LINES = 4000
 
@@ -171,28 +176,26 @@ def load_proxies():
     try:
         if db is None:
             write_log("ERROR", "MongoDB not initialized")
-            return {"proxies": [], "failed": []}
+            return {"proxies": []}
 
         # Get proxies document
         proxies_doc = db.proxies.find_one({'_id': 'proxy_config'})
         if proxies_doc:
             return {
-                'proxies': proxies_doc.get('proxies', []),
-                'failed': proxies_doc.get('failed', [])
+                'proxies': proxies_doc.get('proxies', [])
             }
         else:
             # Create default document if it doesn't exist
-            default_config = {"proxies": [], "failed": []}
+            default_config = {"proxies": []}
             db.proxies.insert_one({
                 '_id': 'proxy_config',
                 'proxies': [],
-                'failed': [],
                 'updated_at': datetime.now(INDIAN_TIMEZONE)
             })
             return default_config
     except Exception as e:
         write_log("ERROR", f"Error loading proxies from MongoDB: {e}")
-        return {"proxies": [], "failed": []}
+        return {"proxies": []}
 
 
 def save_proxies(proxies_data):
@@ -205,7 +208,6 @@ def save_proxies(proxies_data):
         db.proxies.replace_one({'_id': 'proxy_config'}, {
             '_id': 'proxy_config',
             'proxies': proxies_data.get('proxies', []),
-            'failed': proxies_data.get('failed', []),
             'updated_at': datetime.now(INDIAN_TIMEZONE)
         },
                                upsert=True)
@@ -530,7 +532,6 @@ def check_proxies_and_fetch(url,
             return False
 
     proxies = proxies_data["proxies"]
-    failed_proxies = proxies_data.get("failed", [])
     success = False
 
     # Send acknowledgment message for manual fetch
@@ -611,18 +612,13 @@ def check_proxies_and_fetch(url,
                 write_log("INFO", f"Proxy {proxy} ({scheme}) SUCCESS")
                 return True
             else:
-                if proxy_entry not in failed_proxies:
-                    failed_proxies.append(proxy_entry)
-                    proxies_data["failed"] = failed_proxies
-                    save_proxies(proxies_data)
-                    write_log("ERROR",
-                              f"Proxy {proxy} ({scheme}) failed: {error}")
+                write_log("ERROR", f"Proxy {proxy} ({scheme}) failed: {error}")
 
-                    if str(chat_id) != OWNER_ID:
-                        bot.send_message(
-                            OWNER_ID,
-                            f"🚨 Proxy failed: {proxy} ({scheme})\nError: {error}"
-                        )
+                if str(chat_id) != OWNER_ID:
+                    bot.send_message(
+                        OWNER_ID,
+                        f"🚨 Proxy failed: {proxy} ({scheme})\nError: {error}"
+                    )
         except Exception as e:
             write_log("ERROR", f"Error processing proxy {proxy_entry}: {e}")
             continue
@@ -671,13 +667,13 @@ def check_indian_time_and_update():
             f"Checking Indian time: {indian_time.strftime('%Y-%m-%d %H:%M:%S IST')}, minute: {current_minute}"
         )
 
-        if current_minute == 16:
+        if current_minute == TARGET_MINUTE:
             write_log(
                 "INFO",
-                "Indian time minute is 16, running automatic /rf command")
+                f"Indian time minute is {TARGET_MINUTE}, running automatic /rf command")
             subscriptions = load_subscriptions()
 
-            if not subscriptions:
+            if not subscriptions:  
                 write_log("INFO",
                           "No subscriptions found for automatic update")
                 return
@@ -695,34 +691,38 @@ def check_indian_time_and_update():
 
                     all_failed = True  # Assume all requests will fail initially
 
-                    for suffix in suffixes:
-                        url = f"{URL_PREFIX}{suffix}"
-                        if check_proxies_and_fetch(url, chat_id,
-                                                   suffix=suffix):
+                    # Use the multi-station concurrent function for faster processing
+                    if len(suffixes) > 1:
+                        # Process all stations concurrently
+                        if fetch_multiple_stations_concurrent(chat_id, suffixes):
                             all_failed = False  # At least one request succeeded
-
-                        time.sleep(
-                            1)  # Small delay between multiple subscriptions
+                    else:
+                        # For a single subscription, use the regular concurrent function
+                        url = f"{URL_PREFIX}{suffixes[0]}"
+                        if check_proxies_and_fetch_concurrent(url, chat_id, suffix=suffixes[0]):
+                            all_failed = False  # At least one request succeeded
 
                     # Retry failed subscriptions at 17th, 18th, 19th or 20th minute
                     if all_failed:
                         write_log(
                             "INFO",
-                            "All proxies and direct connection failed at 16 minutes, checking at 17, 18, 19 or 20 minutes"
+                            f"All proxies and direct connection failed at {TARGET_MINUTE} minutes, checking at {', '.join(map(str, RETRY_MINUTES))} minutes"
                         )
                         time.sleep(60)  # Wait for the next minute
                         indian_time = datetime.now(INDIAN_TIMEZONE)
-                        if indian_time.minute in [17, 18, 19, 20]:
-                            for suffix in suffixes:
-                                url = f"{URL_PREFIX}{suffix}"
-                                check_proxies_and_fetch(url,
-                                                        chat_id,
-                                                        suffix=suffix)
-                                time.sleep(1)
+                        if indian_time.minute in RETRY_MINUTES:
+                            # Use the multi-station concurrent function for retry
+                            if len(suffixes) > 1:
+                                # Process all stations concurrently
+                                fetch_multiple_stations_concurrent(chat_id, suffixes)
+                            else:
+                                # For a single subscription, use the regular concurrent function
+                                url = f"{URL_PREFIX}{suffixes[0]}"
+                                check_proxies_and_fetch_concurrent(url, chat_id, suffix=suffixes[0])
                         else:
                             write_log(
                                 "INFO",
-                                "It is not 17, 18, 19 or 20 minute anymore, skipping the retry"
+                                f"It is not {', '.join(map(str, RETRY_MINUTES))} minute anymore, skipping the retry"
                             )
 
                 except Exception as e:
@@ -742,7 +742,7 @@ def check_indian_time_and_update():
 def run_indian_time_checker():
     write_log(
         "INFO",
-        "Starting Indian time checker - checking every minute for minute 16")
+        f"Starting Indian time checker - checking every minute for minute {TARGET_MINUTE}")
     while True:
         try:
             check_indian_time_and_update()
@@ -789,7 +789,7 @@ def send_help(message):
 
 <b>Limits:</b>
 • Maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions per user
-• Automatic updates at 16 minutes past every hour (Indian time)
+• Automatic updates at {TARGET_MINUTE} minutes past every hour (Indian time)
             """
         else:
             help_msg = f"""
@@ -809,7 +809,7 @@ def send_help(message):
 
 <b>Limits:</b>
 • Maximum {MAX_SUBSCRIPTIONS_PER_USER} subscriptions per user
-• Automatic updates at 16 minutes past every hour (Indian time)
+• Automatic updates at {TARGET_MINUTE} minutes past every hour (Indian time)
             """
 
         bot.reply_to(message, help_msg, parse_mode='HTML')
@@ -935,8 +935,8 @@ def subscribe(message):
             val_msg.message_id,
             parse_mode='HTML')
 
-        # Fetch and display initial data
-        check_proxies_and_fetch(url,
+        # Fetch and display initial data using concurrent function
+        check_proxies_and_fetch_concurrent(url,
                                 chat_id,
                                 val_msg.message_id,
                                 suffix=suffix)
@@ -1062,7 +1062,7 @@ def unsubscribe(message):
             pass
 
 
-# Command: /rf with error handling - now supports multiple subscriptions
+# Command: /rf with error handling - now supports multiple subscriptions with fully concurrent requests
 @bot.message_handler(commands=['rf'])
 def manual_fetch(message):
     chat_id = str(message.chat.id)
@@ -1074,27 +1074,22 @@ def manual_fetch(message):
                 user_subs = [user_subs]
 
             # Send acknowledgment first
-            ack_msg = bot.reply_to(
+            bot.reply_to(
                 message,
                 f"🔄 Fetching latest weather data for {len(user_subs)} station(s)..."
             )
-
-            for i, suffix in enumerate(user_subs):
-                url = f"{URL_PREFIX}{suffix}"
-                if i == 0:
-                    # Edit the first message
-                    check_proxies_and_fetch(url,
-                                            chat_id,
-                                            ack_msg.message_id,
-                                            is_manual=True,
-                                            suffix=suffix)
-                else:
-                    # Send new messages for additional subscriptions
-                    check_proxies_and_fetch(url,
-                                            chat_id,
-                                            is_manual=False,
-                                            suffix=suffix)
-                    time.sleep(1)  # Small delay between requests
+            
+            # If user has multiple subscriptions, use the multi-station concurrent function
+            if len(user_subs) > 1:
+                # Process all stations concurrently
+                fetch_multiple_stations_concurrent(chat_id, user_subs)
+            else:
+                # For a single subscription, use the regular concurrent function
+                url = f"{URL_PREFIX}{user_subs[0]}"
+                check_proxies_and_fetch_concurrent(url,
+                                        chat_id,
+                                        is_manual=True,
+                                        suffix=user_subs[0])
         else:
             bot.reply_to(
                 message,
@@ -1183,11 +1178,7 @@ def update_proxy(message):
                 parse_mode='HTML')
             return
 
-        # Remove from failed list if it exists there
-        if proxy_entry in proxies_data.get("failed", []):
-            proxies_data["failed"].remove(proxy_entry)
-            write_log("INFO",
-                      f"Removed {proxy_entry} from failed proxies list")
+        # Proxy is new, proceed with adding it
 
         # Add to active proxies list
         if "proxies" not in proxies_data:
@@ -1238,11 +1229,10 @@ def delete_proxy(message):
             return
 
         proxies_data = load_proxies()
-        active_proxies = proxies_data.get("proxies", [])
-        failed_proxies = proxies_data.get("failed", [])
+        proxies = proxies_data.get("proxies", [])
 
-        # Combine all proxies for serial numbering
-        all_proxies = active_proxies + failed_proxies
+        # Get all proxies for serial numbering
+        all_proxies = proxies
 
         if not all_proxies:
             bot.reply_to(
@@ -1261,21 +1251,15 @@ def delete_proxy(message):
         # Get the proxy at the serial position (subtract 1 for 0-based index)
         proxy_to_remove = all_proxies[serial_num - 1]
 
-        # Determine if it's in active or failed list and remove it
-        if proxy_to_remove in active_proxies:
-            proxies_data["proxies"].remove(proxy_to_remove)
-            proxy_type = "active"
-        else:
-            proxies_data["failed"].remove(proxy_to_remove)
-            proxy_type = "failed"
+        # Remove the proxy from the list
+        proxies_data["proxies"].remove(proxy_to_remove)
 
         save_proxies(proxies_data)
-        write_log("INFO",
-                  f"Owner deleted {proxy_type} proxy: {proxy_to_remove}")
+        write_log("INFO", f"Owner deleted proxy: {proxy_to_remove}")
 
         bot.reply_to(
             message,
-            f"✅ <b>{proxy_type.title()} proxy deleted successfully!</b>\n\n📡 <b>Removed:</b> <code>{proxy_to_remove}</code> (Serial #{serial_num})\n📊 <b>Remaining active proxies:</b> {len(proxies_data.get('proxies', []))}\n📊 <b>Remaining failed proxies:</b> {len(proxies_data.get('failed', []))}",
+            f"✅ <b>Proxy deleted successfully!</b>\n\n📡 <b>Removed:</b> <code>{proxy_to_remove}</code> (Serial #{serial_num})\n📊 <b>Remaining proxies:</b> {len(proxies_data.get('proxies', []))}",
             parse_mode='HTML')
 
     except Exception as e:
@@ -1298,14 +1282,13 @@ def proxy_list(message):
 
         proxies_data = load_proxies()
         active_proxies = proxies_data.get("proxies", [])
-        failed_proxies = proxies_data.get("failed", [])
 
         msg = "🔗 <b>Proxy Configuration</b>\n\n"
         serial_counter = 1
 
         # Active proxies with serial numbers
         if active_proxies:
-            msg += f"✅ <b>Active Proxies ({len(active_proxies)}):</b>\n"
+            msg += f"✅ <b>Proxies ({len(active_proxies)}):</b>\n"
             for proxy in active_proxies:
                 try:
                     ip_port, protocol = proxy.rsplit(':', 1)
@@ -1314,22 +1297,7 @@ def proxy_list(message):
                     msg += f"{serial_counter}. <code>{proxy}</code> (Invalid format)\n"
                 serial_counter += 1
         else:
-            msg += "✅ <b>Active Proxies:</b> None\n"
-
-        msg += "\n"
-
-        # Failed proxies with serial numbers
-        if failed_proxies:
-            msg += f"❌ <b>Failed Proxies ({len(failed_proxies)}):</b>\n"
-            for proxy in failed_proxies:
-                try:
-                    ip_port, protocol = proxy.rsplit(':', 1)
-                    msg += f"{serial_counter}. <code>{ip_port}</code> ({protocol.upper()})\n"
-                except:
-                    msg += f"{serial_counter}. <code>{proxy}</code> (Invalid format)\n"
-                serial_counter += 1
-        else:
-            msg += "❌ <b>Failed Proxies:</b> None\n"
+            msg += "✅ <b>Proxies:</b> None\n"
 
         msg += f"\n💡 <b>Commands:</b>\n• <code>/update_proxy ip:port:protocol</code>\n• <code>/delete_proxy &lt;serial_number&gt;</code>"
 
@@ -1616,6 +1584,273 @@ def modify_user(message):
             except:
                 pass
 
+
+# Async function to fetch data from a URL using a proxy
+async def fetch_data_async(url, proxy_entry, session):
+    try:
+        if ':' not in proxy_entry:
+            return None, f"Invalid proxy format: {proxy_entry}"
+
+        proxy, scheme = proxy_entry.rsplit(':', 1)
+        proxy_url = f"{scheme}://{proxy.split(':')[0]}:{proxy.split(':')[1]}"
+        
+        async with session.get(url, proxy=proxy_url, timeout=10) as response:
+            html = await response.text()
+            
+            # Check for invalid range error
+            if "Invalid Range" in html:
+                return None, "Invalid station ID - station does not exist"
+
+            table_start = html.find('<table')
+            table_end = html.find('</table>') + len('</table>')
+            if table_start == -1 or table_end == -1:
+                return None, "Table not found in HTML"
+
+            table_html = html[table_start:table_end]
+            rows = [
+                row.strip() for row in table_html.split('<tr>')[1:]
+                if '</tr>' in row
+            ]
+            table_data = []
+
+            for row in rows:
+                cells = [
+                    cell.strip() for cell in row.split('<td>')[1:]
+                    if '</td>' in cell
+                ]
+                if len(cells) >= 2:
+                    key = cells[0].split('</td>')[0].replace(
+                        '<span class="style46">', '').replace('</span>',
+                                                              '').strip()
+                    value = cells[1].split('</td>')[0]
+                    while '<' in value and '>' in value:
+                        start = value.find('<')
+                        end = value.find('>', start) + 1
+                        if end == 0:
+                            break
+                        value = value[:start] + value[end:]
+                    value = value.strip()
+
+                    # Skip Latitude and Longitude entries
+                    if key.lower() in ['latitude', 'longitude']:
+                        continue
+
+                    table_data.append((key, value))
+
+            return table_data, proxy_entry
+    except Exception as e:
+        return None, str(e)
+
+# Async function to try multiple proxies concurrently
+async def fetch_with_proxies_async(url, proxies):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for proxy_entry in proxies:
+            task = asyncio.create_task(fetch_data_async(url, proxy_entry, session))
+            tasks.append(task)
+        
+        # Wait for first successful result or all to complete
+        for completed_task in asyncio.as_completed(tasks):
+            table_data, result = await completed_task
+            if table_data:  # If we got data successfully
+                # Cancel all other tasks
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                return table_data, result  # Return the successful result
+        
+        # If we get here, all proxies failed
+        return None, "All proxies failed"
+
+# Async function to fetch multiple URLs concurrently
+async def fetch_multiple_urls_async(urls, proxies):
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        tasks = {}
+        
+        # Create tasks for each URL
+        for url_key, url in urls.items():
+            # For each URL, try all proxies concurrently
+            url_tasks = []
+            for proxy_entry in proxies:
+                task = asyncio.create_task(fetch_data_async(url, proxy_entry, session))
+                url_tasks.append(task)
+            tasks[url_key] = url_tasks
+        
+        # Process each URL's tasks
+        for url_key, url_tasks in tasks.items():
+            # Wait for first successful result for this URL or all to complete
+            for completed_task in asyncio.as_completed(url_tasks):
+                table_data, result = await completed_task
+                if table_data:  # If we got data successfully
+                    # Cancel all other tasks for this URL
+                    for task in url_tasks:
+                        if not task.done():
+                            task.cancel()
+                    results[url_key] = (table_data, result)
+                    break
+            
+            # If no successful result for this URL, store None
+            if url_key not in results:
+                results[url_key] = (None, "All proxies failed")
+        
+        return results
+
+# Function to fetch multiple URLs concurrently for a user with multiple subscriptions
+def fetch_multiple_stations_concurrent(chat_id, suffixes):
+    proxies_data = load_proxies()
+    
+    # Check if proxies data is valid
+    if not proxies_data or "proxies" not in proxies_data or not isinstance(
+            proxies_data["proxies"], list) or not proxies_data["proxies"]:
+        # Try direct requests as fallback
+        write_log("INFO", "No valid proxies, attempting direct requests")
+        success_count = 0
+        for suffix in suffixes:
+            url = f"{URL_PREFIX}{suffix}"
+            table_data, error = fetch_table_data_direct(url)
+            if table_data:
+                formatted_data = format_table_data(table_data, suffix)
+                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                success_count += 1
+        
+        return success_count > 0
+    
+    # Prepare URLs dictionary
+    urls = {suffix: f"{URL_PREFIX}{suffix}" for suffix in suffixes}
+    
+    # Run the async function to fetch data concurrently
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        results = loop.run_until_complete(
+            fetch_multiple_urls_async(urls, proxies_data["proxies"]))
+        
+        # Process results
+        success_count = 0
+        for suffix, (table_data, result) in results.items():
+            if table_data:
+                # Success with one of the proxies
+                formatted_data = format_table_data(table_data, suffix)
+                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                write_log("INFO", f"Proxy {result} SUCCESS for station {suffix} (concurrent)")
+                success_count += 1
+            else:
+                # All proxies failed, try direct request for this URL
+                url = urls[suffix]
+                write_log("INFO", f"All proxies failed for station {suffix}, trying direct request")
+                table_data, error = fetch_table_data_direct(url)
+                
+                if table_data:
+                    formatted_data = format_table_data(table_data, suffix)
+                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                    write_log("INFO", f"Direct request SUCCESS for station {suffix} (fallback)")
+                    success_count += 1
+                else:
+                    write_log("ERROR", f"Direct request also failed for station {suffix}: {error}")
+        
+        return success_count > 0
+    except Exception as e:
+        write_log("ERROR", f"Error in concurrent multi-station fetch: {e}")
+        return False
+    finally:
+        loop.close()
+
+# Function to check proxies and fetch data concurrently
+def check_proxies_and_fetch_concurrent(url, chat_id, message_id=None, is_manual=False, suffix=None):
+    proxies_data = load_proxies()
+    
+    # Check if proxies data is valid
+    if not proxies_data or "proxies" not in proxies_data or not isinstance(
+            proxies_data["proxies"], list) or not proxies_data["proxies"]:
+        # Try direct request as fallback
+        write_log("INFO", "No valid proxies, attempting direct request")
+        table_data, error = fetch_table_data_direct(url)
+        
+        if table_data:
+            formatted_data = format_table_data(table_data, suffix)
+            if message_id:
+                try:
+                    bot.edit_message_text(formatted_data,
+                                          chat_id,
+                                          message_id,
+                                          parse_mode='HTML')
+                except Exception as e:
+                    bot.send_message(chat_id,
+                                     formatted_data,
+                                     parse_mode='HTML')
+            else:
+                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+            write_log("INFO", "Direct request SUCCESS")
+            return True
+        else:
+            write_log("ERROR", f"Direct request failed: {error}")
+            return False
+    
+    # Send acknowledgment message for manual fetch
+    if is_manual and not message_id:
+        ack_msg = bot.send_message(chat_id,
+                                   "🔄 Fetching latest weather data...")
+        message_id = ack_msg.message_id
+    
+    # Run the async function to fetch data concurrently
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        table_data, result = loop.run_until_complete(
+            fetch_with_proxies_async(url, proxies_data["proxies"]))
+        
+        if table_data:
+            # Success with one of the proxies
+            formatted_data = format_table_data(table_data, suffix)
+            if message_id:
+                try:
+                    bot.edit_message_text(formatted_data,
+                                          chat_id,
+                                          message_id,
+                                          parse_mode='HTML')
+                except Exception as e:
+                    bot.send_message(chat_id,
+                                     formatted_data,
+                                     parse_mode='HTML')
+            else:
+                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+            
+            write_log("INFO", f"Proxy {result} SUCCESS (concurrent)")
+            return True
+        else:
+            # All proxies failed, try direct request
+            write_log("INFO", "All proxies failed concurrently, trying direct request")
+            table_data, error = fetch_table_data_direct(url)
+            
+            if table_data:
+                formatted_data = format_table_data(table_data, suffix)
+                if message_id:
+                    try:
+                        bot.edit_message_text(formatted_data,
+                                              chat_id,
+                                              message_id,
+                                              parse_mode='HTML')
+                    except Exception as e:
+                        bot.send_message(chat_id,
+                                         formatted_data,
+                                         parse_mode='HTML')
+                else:
+                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                write_log("INFO", "Direct request SUCCESS (fallback after concurrent failure)")
+                return True
+            else:
+                write_log("ERROR", f"Direct request also failed: {error}")
+                if str(chat_id) != OWNER_ID:
+                    bot.send_message(
+                        OWNER_ID,
+                        f"🚨 All connection methods failed for user {chat_id}.")
+                return False
+    except Exception as e:
+        write_log("ERROR", f"Error in concurrent proxy fetch: {e}")
+        return False
+    finally:
+        loop.close()
 
 # Start the bot with infinite polling and comprehensive error handling
 def start_bot():
