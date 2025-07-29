@@ -4,3 +4,4 @@ schedule
 Flask
 PySocks
 pymongo
+aiohttp
