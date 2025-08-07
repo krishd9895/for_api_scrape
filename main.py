@@ -58,7 +58,7 @@ MAX_SUBSCRIPTIONS_PER_USER = 4
 INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 TARGET_MINUTE = 16
-RETRY_MINUTES = [17, 18, 19, 20]
+RETRY_MINUTES = [17, 18, 19, 20, 21, 22]
 
 MAX_LOG_LINES = 4000
 
@@ -524,11 +524,6 @@ def check_proxies_and_fetch(url,
             return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
-            if str(chat_id) != OWNER_ID:
-                bot.send_message(
-                    OWNER_ID,
-                    f"🚨 All connection methods failed for user {chat_id}.\nDirect request error"
-                )
             return False
 
     proxies = proxies_data["proxies"]
@@ -544,12 +539,6 @@ def check_proxies_and_fetch(url,
     if not proxies:
         error_msg = "No proxies available in configuration."
         write_log("ERROR", "Proxies list is empty")
-
-        if str(chat_id) != OWNER_ID:
-            bot.send_message(
-                OWNER_ID,
-                "🚨 No proxies available. Please add proxies using /update_proxy command."
-            )
 
         # Try direct request as fallback
         write_log("INFO", "No proxies available, attempting direct request")
@@ -573,11 +562,6 @@ def check_proxies_and_fetch(url,
             return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
-            if str(chat_id) != OWNER_ID:
-                bot.send_message(
-                    OWNER_ID,
-                    f"🚨 All connection methods failed for user {chat_id}.\nDirect request error"
-                )
             return False
 
     # Try each proxy
@@ -613,12 +597,6 @@ def check_proxies_and_fetch(url,
                 return True
             else:
                 write_log("ERROR", f"Proxy {proxy} ({scheme}) failed: {error}")
-
-                if str(chat_id) != OWNER_ID:
-                    bot.send_message(
-                        OWNER_ID,
-                        f"🚨 Proxy failed: {proxy} ({scheme})\nError: {error}"
-                    )
         except Exception as e:
             write_log("ERROR", f"Error processing proxy {proxy_entry}: {e}")
             continue
@@ -647,11 +625,6 @@ def check_proxies_and_fetch(url,
             return True
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
-            if str(chat_id) != OWNER_ID:
-                bot.send_message(
-                    OWNER_ID,
-                    f"🚨 All proxies and direct connection failed for user {chat_id}.\nLast error"
-                )
             return False
     return False
 
@@ -702,15 +675,76 @@ def check_indian_time_and_update():
                         if check_proxies_and_fetch_concurrent(url, chat_id, suffix=suffixes[0]):
                             all_failed = False  # At least one request succeeded
 
-                    # Retry failed subscriptions at 17th, 18th, 19th or 20th minute
+                    # Retry mechanism for proxy failures
                     if all_failed:
                         write_log(
                             "INFO",
-                            f"All proxies and direct connection failed at {TARGET_MINUTE} minutes, checking at {', '.join(map(str, RETRY_MINUTES))} minutes"
+                            f"All proxies and direct connection failed at {TARGET_MINUTE} minutes, implementing proxy retry mechanism"
                         )
-                        time.sleep(60)  # Wait for the next minute
+                        
+                        # Reload proxies to get any updated ones
+                        proxies_data = load_proxies()
+                        if proxies_data and "proxies" in proxies_data and isinstance(
+                                proxies_data["proxies"], list) and proxies_data["proxies"]:
+                            
+                            # Try up to 3 times with exponential backoff, but only with proxies
+                            for retry_attempt in range(3):
+                                # Calculate backoff time: 10, 20, 40 seconds
+                                backoff_time = 10 * (2 ** retry_attempt)
+                                write_log("INFO", f"Proxy retry attempt {retry_attempt+1}/3 after {backoff_time} seconds")
+                                time.sleep(backoff_time)
+                                
+                                # Use the async functions to retry with proxies only
+                                retry_success = False
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                
+                                try:
+                                    if len(suffixes) > 1:
+                                        # For multiple stations, prepare URLs dictionary
+                                        urls = {suffix: f"{URL_PREFIX}{suffix}" for suffix in suffixes}
+                                        results = loop.run_until_complete(
+                                            fetch_multiple_urls_async(urls, proxies_data["proxies"]))
+                                        
+                                        # Process results
+                                        success_count = 0
+                                        for suffix, (table_data, result) in results.items():
+                                            if table_data:
+                                                formatted_data = format_table_data(table_data, suffix)
+                                                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                                                write_log("INFO", f"Proxy {result} SUCCESS for station {suffix} (retry {retry_attempt+1})")
+                                                success_count += 1
+                                        
+                                        retry_success = success_count > 0
+                                    else:
+                                        # For a single subscription
+                                        url = f"{URL_PREFIX}{suffixes[0]}"
+                                        table_data, result = loop.run_until_complete(
+                                            fetch_with_proxies_async(url, proxies_data["proxies"]))
+                                        
+                                        if table_data:
+                                            formatted_data = format_table_data(table_data, suffixes[0])
+                                            bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                                            write_log("INFO", f"Proxy {result} SUCCESS (retry {retry_attempt+1})")
+                                            retry_success = True
+                                except Exception as e:
+                                    write_log("ERROR", f"Error in proxy retry attempt {retry_attempt+1}: {e}")
+                                finally:
+                                    loop.close()
+                                
+                                # If successful, break out of retry loop
+                                if retry_success:
+                                    write_log("INFO", f"Proxy retry attempt {retry_attempt+1} succeeded")
+                                    break
+                                elif retry_attempt == 2:  # Last attempt
+                                    write_log("INFO", "All proxy retry attempts failed")
+                        else:
+                            write_log("INFO", "No valid proxies available for retry")
+                        
+                        # Also check at specific minutes as a fallback
                         indian_time = datetime.now(INDIAN_TIMEZONE)
                         if indian_time.minute in RETRY_MINUTES:
+                            write_log("INFO", f"Additional retry at minute {indian_time.minute}")
                             # Use the multi-station concurrent function for retry
                             if len(suffixes) > 1:
                                 # Process all stations concurrently
@@ -719,11 +753,6 @@ def check_indian_time_and_update():
                                 # For a single subscription, use the regular concurrent function
                                 url = f"{URL_PREFIX}{suffixes[0]}"
                                 check_proxies_and_fetch_concurrent(url, chat_id, suffix=suffixes[0])
-                        else:
-                            write_log(
-                                "INFO",
-                                f"It is not {', '.join(map(str, RETRY_MINUTES))} minute anymore, skipping the retry"
-                            )
 
                 except Exception as e:
                     write_log(
@@ -1641,8 +1670,9 @@ async def fetch_data_async(url, proxy_entry, session):
     except Exception as e:
         return None, str(e)
 
-# Async function to try multiple proxies concurrently
+# Async function to try multiple proxies concurrently with retry mechanism
 async def fetch_with_proxies_async(url, proxies):
+    # First attempt with standard timeout
     async with aiohttp.ClientSession() as session:
         tasks = []
         for proxy_entry in proxies:
@@ -1658,11 +1688,32 @@ async def fetch_with_proxies_async(url, proxies):
                     if not task.done():
                         task.cancel()
                 return table_data, result  # Return the successful result
+    
+    # If we get here, all proxies failed on first attempt, try retries
+    write_log("INFO", f"All proxies failed for URL {url}, implementing async retry")
+    
+    # Try up to 2 more times with different timeouts
+    for retry_attempt in range(2):
+        write_log("INFO", f"Async retry attempt {retry_attempt+1}/2")
         
-        # If we get here, all proxies failed
-        return None, "All proxies failed"
+        # Increase timeout for retries: 15s, 20s
+        timeout = 15 + (retry_attempt * 5)
+        
+        # Try each proxy again with increased timeout
+        for proxy_entry in proxies:
+            try:
+                # Create a custom session with longer timeout for retries
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as retry_session:
+                    table_data, result = await fetch_data_async(url, proxy_entry, retry_session)
+                    if table_data:  # Success
+                        return table_data, f"{result} (retry {retry_attempt+1})"  # Return the successful result
+            except Exception as e:
+                continue  # Try next proxy
+    
+    # If we get here, all proxies failed after retries
+    return None, "All proxies failed after retries"
 
-# Async function to fetch multiple URLs concurrently
+# Async function to fetch multiple URLs concurrently with retry mechanism
 async def fetch_multiple_urls_async(urls, proxies):
     results = {}
     async with aiohttp.ClientSession() as session:
@@ -1680,6 +1731,7 @@ async def fetch_multiple_urls_async(urls, proxies):
         # Process each URL's tasks
         for url_key, url_tasks in tasks.items():
             # Wait for first successful result for this URL or all to complete
+            success = False
             for completed_task in asyncio.as_completed(url_tasks):
                 table_data, result = await completed_task
                 if table_data:  # If we got data successfully
@@ -1688,11 +1740,40 @@ async def fetch_multiple_urls_async(urls, proxies):
                         if not task.done():
                             task.cancel()
                     results[url_key] = (table_data, result)
+                    success = True
                     break
             
-            # If no successful result for this URL, store None
-            if url_key not in results:
-                results[url_key] = (None, "All proxies failed")
+            # If no successful result for this URL, try with retry
+            if not success:
+                write_log("INFO", f"All proxies failed for {url_key}, implementing async retry")
+                
+                # Try up to 2 more times with different timeouts
+                for retry_attempt in range(2):
+                    write_log("INFO", f"Async retry attempt {retry_attempt+1}/2 for {url_key}")
+                    
+                    # Increase timeout for retries: 15s, 20s
+                    timeout = 15 + (retry_attempt * 5)
+                    
+                    # Try each proxy again with increased timeout
+                    retry_tasks = []
+                    for proxy_entry in proxies:
+                        # Create a custom session with longer timeout for retries
+                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as retry_session:
+                            try:
+                                table_data, result = await fetch_data_async(urls[url_key], proxy_entry, retry_session)
+                                if table_data:  # Success
+                                    results[url_key] = (table_data, f"{result} (retry {retry_attempt+1})")
+                                    success = True
+                                    break
+                            except Exception as e:
+                                continue  # Try next proxy
+                    
+                    if success:  # If any proxy succeeded in this retry attempt
+                        break
+                
+                # If still no successful result after retries, store None
+                if not success:
+                    results[url_key] = (None, "All proxies failed after retries")
         
         return results
 
@@ -1703,16 +1784,23 @@ def fetch_multiple_stations_concurrent(chat_id, suffixes):
     # Check if proxies data is valid
     if not proxies_data or "proxies" not in proxies_data or not isinstance(
             proxies_data["proxies"], list) or not proxies_data["proxies"]:
-        # Try direct requests as fallback
+        # Try direct requests as fallback (no retry for direct requests)
         write_log("INFO", "No valid proxies, attempting direct requests")
         success_count = 0
+        
         for suffix in suffixes:
             url = f"{URL_PREFIX}{suffix}"
+            # Direct request without retry
+            write_log("INFO", f"Direct request for station {suffix}")
             table_data, error = fetch_table_data_direct(url)
+            
             if table_data:
                 formatted_data = format_table_data(table_data, suffix)
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
                 success_count += 1
+                write_log("INFO", f"Direct request SUCCESS for station {suffix}")
+            else:
+                write_log("ERROR", f"Direct request failed for station {suffix}: {error}")
         
         return success_count > 0
     
@@ -1763,8 +1851,10 @@ def check_proxies_and_fetch_concurrent(url, chat_id, message_id=None, is_manual=
     # Check if proxies data is valid
     if not proxies_data or "proxies" not in proxies_data or not isinstance(
             proxies_data["proxies"], list) or not proxies_data["proxies"]:
-        # Try direct request as fallback
+        # Try direct request as fallback (no retry for direct requests)
         write_log("INFO", "No valid proxies, attempting direct request")
+        
+        # Single direct request without retry
         table_data, error = fetch_table_data_direct(url)
         
         if table_data:
@@ -1819,8 +1909,10 @@ def check_proxies_and_fetch_concurrent(url, chat_id, message_id=None, is_manual=
             write_log("INFO", f"Proxy {result} SUCCESS (concurrent)")
             return True
         else:
-            # All proxies failed, try direct request
+            # All proxies failed, try direct request (no retry for direct requests)
             write_log("INFO", "All proxies failed concurrently, trying direct request")
+            
+            # Single direct request without retry
             table_data, error = fetch_table_data_direct(url)
             
             if table_data:
@@ -1840,11 +1932,7 @@ def check_proxies_and_fetch_concurrent(url, chat_id, message_id=None, is_manual=
                 write_log("INFO", "Direct request SUCCESS (fallback after concurrent failure)")
                 return True
             else:
-                write_log("ERROR", f"Direct request also failed: {error}")
-                if str(chat_id) != OWNER_ID:
-                    bot.send_message(
-                        OWNER_ID,
-                        f"🚨 All connection methods failed for user {chat_id}.")
+                write_log("ERROR", f"Direct request failed: {error}")
                 return False
     except Exception as e:
         write_log("ERROR", f"Error in concurrent proxy fetch: {e}")
