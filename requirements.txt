@@ -6,3 +6,4 @@ PySocks
 pymongo
 aiohttp
 python-dotenv
+psutil
