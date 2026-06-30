@@ -1,5 +1,12 @@
 import os
 from datetime import timezone, timedelta
+try:
+    from dotenv import load_dotenv
+    # Load environment variables from .env file if it exists
+    load_dotenv()
+except ImportError:
+    # If python-dotenv is not installed, just use the system environment variables
+    pass
 
 # Configuration file for weather bot
 
@@ -24,7 +31,7 @@ RETRY_MINUTES = [17, 18, 19, 20, 21, 22]
 # Choose connection priority:
 # "proxy" - Try proxy connections first, fallback to direct
 # "direct" - Try direct connection first, fallback to proxies
-CONNECTION_PRIORITY = "direct"
+CONNECTION_PRIORITY = "proxy"
 
 # Maximum subscriptions per user
 MAX_SUBSCRIPTIONS_PER_USER = 4
