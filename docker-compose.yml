@@ -10,6 +10,7 @@ services:
       - MONGO_URI=${MONGO_URI}
       - OWNER_ID=${OWNER_ID}
       - URL_PREFIX=${URL_PREFIX}
+      - PORT=${PORT:-10000}
     restart: "on-failure"
     logging:
       driver: "json-file"
