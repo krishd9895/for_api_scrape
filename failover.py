@@ -572,10 +572,12 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             db_disconnect_tracker = None
 
             if is_this_node_current_leader:
-                # Check if there is a forced leader that is NOT us
+                # Check if there is a forced leader that is NOT us AND is active
                 if forced_leader and not this_node_is_forced_leader:
-                    logger.warning(f"[LEADER STATUS] Administrative override active! Forced leader '{forced_leader}' is set. Stepping down.")
-                    return False
+                    is_fl_active = is_forced_leader_currently_active(doc, forced_leader)
+                    if is_fl_active:
+                        logger.warning(f"[LEADER STATUS] Administrative override active! Forced leader '{forced_leader}' is active. Stepping down.")
+                        return False
                 return True
             return False
 
