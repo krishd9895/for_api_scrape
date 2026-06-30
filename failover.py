@@ -260,7 +260,7 @@ def release_leadership():
         logger.error(f"Failed to issue clean leadership release: {e}")
 
 def is_forced_leader_active(doc):
-    """Check if forced leader is active (has a recent heartbeat or is current owner)."""
+    """Check if forced leader is active (is current owner or has a recent heartbeat as owner)."""
     forced_leader = doc.get("forced_leader_node")
     if not forced_leader:
         return False
@@ -269,16 +269,31 @@ def is_forced_leader_active(doc):
     owner_node_id = doc.get("owner_node_id")
     doc_node_alias = doc.get("node_alias")
     
-    # If document's node_alias is forced_leader and status is active, it's active
+    # Case 1: Current document's node_alias is forced_leader and status is active
     if doc_node_alias == forced_leader and doc.get("status") == "active":
         return True
     
-    # If last heartbeat is within HEARTBEAT_TIMEOUT, consider active
-    if owner_node_id and last_heartbeat:
-        time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
-        if time_since_heartbeat < HEARTBEAT_TIMEOUT:
+    # Case 2: Forced leader is the current owner and has a recent heartbeat
+    # Wait, we don't know the forced leader's NODE_ID, only NODE_ALIAS!
+    # So we have to rely on: if the current owner is the forced leader (doc_node_alias == forced_leader)
+    # OR if there's no owner, or if the current owner's heartbeat is expired
+    # Wait, let's rethink: forced_leader_active should be True only if the forced_leader is the current owner (doc_node_alias == forced_leader and status active)
+    # OR if we know the forced_leader is the one with the recent heartbeat
+    # Since we don't store NODE_IDs for other nodes, let's simplify:
+    # forced_leader_active is True only if:
+    # 1. doc_node_alias == forced_leader and status == "active", OR
+    # 2. There's a recent heartbeat and doc_node_alias == forced_leader
+    if doc_node_alias == forced_leader:
+        # If document is from forced_leader, check status and heartbeat
+        if doc.get("status") == "active":
             return True
-    
+        if last_heartbeat:
+            if last_heartbeat.tzinfo is None:
+                last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+            time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
+            if time_since_heartbeat < HEARTBEAT_TIMEOUT:
+                return True
+    # Otherwise, forced leader is not active
     return False
 
 def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=False):
@@ -300,14 +315,39 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             is_owner = (doc.get("owner_node_id") == NODE_ID)
             
             if is_owner and forced_leader:
-                if is_forced_leader_active(doc) and forced_leader != NODE_ALIAS:
-                    logger.warning(f"Administrative override active! Forced leader '{forced_leader}' is back online. Stepping down.")
-                    return False
+                try:
+                    if is_forced_leader_active(doc) and forced_leader != NODE_ALIAS:
+                        logger.warning(f"Administrative override active! Forced leader '{forced_leader}' is back online. Stepping down.")
+                        return False
+                except Exception as e:
+                    logger.error(f"Error checking forced leader status: {e}")
+                    # If there's an error, don't step down
+                    pass
             
             return is_owner
 
         # Determine if forced leader is active
-        forced_leader_active = is_forced_leader_active(doc)
+        forced_leader_active = False
+        try:
+            forced_leader_active = is_forced_leader_active(doc)
+        except Exception as e:
+            logger.error(f"Error checking forced leader status: {e}")
+            forced_leader_active = False
+        
+        # Check if current owner (if any) has a valid heartbeat
+        current_owner_active = False
+        last_heartbeat = doc.get("last_heartbeat")
+        owner_node_id = doc.get("owner_node_id")
+        if owner_node_id and last_heartbeat:
+            try:
+                if last_heartbeat.tzinfo is None:
+                    last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+                time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
+                if time_since_heartbeat < HEARTBEAT_TIMEOUT:
+                    current_owner_active = True
+            except Exception as e:
+                logger.error(f"Error checking current owner heartbeat: {e}")
+                current_owner_active = False
         
         # STRICT ATOMIC FILTER CONDITIONAL MATCHER:
         if forced_leader and forced_leader_active:
@@ -316,7 +356,11 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                 return False
             filter_query = {"_id": SERVICE_ID, "forced_leader_node": NODE_ALIAS}
         else:
-            # Either no forced leader, or forced leader is offline - let anyone take over
+            # Either:
+            # 1. No forced leader, OR
+            # 2. Forced leader is inactive, OR
+            # 3. Current owner's heartbeat is expired
+            # Let anyone take over
             filter_query = {
                 "_id": SERVICE_ID,
                 "$expr": {
