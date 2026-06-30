@@ -19,6 +19,14 @@
 #   "forced_leader": {
 #     "node_alias": "hostname:hash" // or null
 #   },
+#   "standby_nodes": [
+#     {
+#       "node_id": "uuid:/app",
+#       "node_alias": "hostname:hash",
+#       "hostname": "...",
+#       "last_heartbeat": ISODate("...")
+#     }
+#   ],
 #   "config_fingerprint": "..."
 # }
 #
@@ -27,6 +35,7 @@
 # - Forced leader: You can force a specific node to be leader via MongoDB
 # - Graceful shutdown: Handles SIGINT/SIGTERM properly
 # - Automatic restart: If the application crashes, it restarts it up to LOCAL_RETRY_LIMIT times
+# - Standby node tracking: All standby nodes send heartbeats and are tracked in MongoDB
 #
 # INSTRUCTIONS:
 # 1. Provide your 'MONGO_URI' inside your local .env file (Mandatory).
@@ -303,7 +312,7 @@ def terminate_child():
 # ---------------------------------------------------------------------------
 def setup_database_indexes():
     """
-    Creates an index on owner_node_id to speed up leadership queries.
+    Creates indexes to speed up queries.
     Safe to run multiple times (idempotent).
     """
     try:
@@ -344,6 +353,93 @@ def is_leader_active(doc):
         logger.error(f"Error checking leader heartbeat: {e}")
         return False
 
+def remove_stale_standby_nodes(doc):
+    """
+    Remove standby nodes that haven't sent a heartbeat in HEARTBEAT_TIMEOUT seconds
+    """
+    standby_nodes = doc.get("standby_nodes", [])
+    current_time = datetime.now(timezone.utc)
+    updated_standby_nodes = []
+
+    for node in standby_nodes:
+        last_heartbeat = node.get("last_heartbeat")
+        if last_heartbeat:
+            try:
+                if last_heartbeat.tzinfo is None:
+                    last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+                time_since_heartbeat = (current_time - last_heartbeat).total_seconds()
+                if time_since_heartbeat < HEARTBEAT_TIMEOUT:
+                    updated_standby_nodes.append(node)
+            except Exception as e:
+                logger.error(f"Error checking standby node heartbeat: {e}")
+
+    return updated_standby_nodes
+
+def update_standby_node_heartbeat():
+    """
+    Add or update this node's entry in standby_nodes with current heartbeat
+    """
+    try:
+        current_time = datetime.now(timezone.utc)
+        # First, get the document to check existing standby nodes
+        doc = db_collection.find_one({"_id": SERVICE_ID})
+        if not doc:
+            return
+
+        # Remove stale standby nodes first
+        updated_standby_nodes = remove_stale_standby_nodes(doc)
+
+        # Find if this node is already in standby_nodes
+        node_found = False
+        for i, node in enumerate(updated_standby_nodes):
+            if node.get("node_id") == NODE_ID:
+                updated_standby_nodes[i] = {
+                    "node_id": NODE_ID,
+                    "node_alias": NODE_ALIAS,
+                    "hostname": HOSTNAME,
+                    "last_heartbeat": current_time
+                }
+                node_found = True
+                break
+
+        if not node_found:
+            updated_standby_nodes.append({
+                "node_id": NODE_ID,
+                "node_alias": NODE_ALIAS,
+                "hostname": HOSTNAME,
+                "last_heartbeat": current_time
+            })
+
+        # Update MongoDB
+        db_collection.update_one(
+            {"_id": SERVICE_ID},
+            {"$set": {"standby_nodes": updated_standby_nodes}}
+        )
+        logger.debug("[STANDBY HEARTBEAT] Updated standby heartbeat successfully")
+    except Exception as e:
+        logger.error(f"Failed to update standby heartbeat: {e}")
+
+def remove_self_from_standby():
+    """
+    Remove this node from standby_nodes (when we become leader or shut down)
+    """
+    try:
+        # First, get the document to check existing standby nodes
+        doc = db_collection.find_one({"_id": SERVICE_ID})
+        if not doc:
+            return
+
+        updated_standby_nodes = [node for node in doc.get("standby_nodes", []) if node.get("node_id") != NODE_ID]
+
+        # Update MongoDB
+        db_collection.update_one(
+            {"_id": SERVICE_ID},
+            {"$set": {"standby_nodes": updated_standby_nodes}}
+        )
+        logger.debug("[STANDBY] Removed self from standby nodes")
+    except Exception as e:
+        logger.error(f"Failed to remove self from standby nodes: {e}")
+
 def bootstrap_and_validate_lock():
     """
     1. Creates the initial cluster control document in MongoDB if it doesn't exist
@@ -367,6 +463,7 @@ def bootstrap_and_validate_lock():
                 "forced_leader": {
                     "node_alias": None
                 },
+                "standby_nodes": [],
                 "config_fingerprint": CONFIG_FINGERPRINT
             }
             try:
@@ -386,6 +483,13 @@ def bootstrap_and_validate_lock():
                     {"$set": {"forced_leader.node_alias": None}}
                 )
 
+            # Ensure standby_nodes exists
+            if "standby_nodes" not in doc:
+                db_collection.update_one(
+                    {"_id": SERVICE_ID},
+                    {"$set": {"standby_nodes": []}}
+                )
+
         # Verify that all nodes are running the same configuration
         if doc and doc.get("config_fingerprint") != CONFIG_FINGERPRINT:
             logger.critical("🚨 CONFIGURATION FINGERPRINT MISMATCH! Execution immediately halted.")
@@ -400,20 +504,15 @@ def bootstrap_and_validate_lock():
 
 def release_leadership():
     """
-    Voluntarily step down as leader
+    Voluntarily step down as leader - but don't clear current_leader fields
+    unless we're the current owner
     """
     try:
         query = {"_id": SERVICE_ID, "current_leader.node_id": NODE_ID}
-        update = {
-            "$set": {
-                "current_leader.node_id": None,
-                "current_leader.node_alias": None,
-                "current_leader.status": "offline",
-                "current_leader.last_heartbeat": datetime.fromtimestamp(0, tz=timezone.utc),
-                "current_leader.hostname": None
-            }
-        }
-        db_collection.update_one(query, update)
+        # Only update if we're still the leader
+        result = db_collection.find_one(query)
+        if result:
+            logger.info(f"[LEADER STATUS] Stepping down as leader - was previously active node")
         logger.info("Released leadership lock successfully.")
     except Exception as e:
         logger.error(f"Failed to issue clean leadership release: {e}")
@@ -446,9 +545,13 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
         is_this_node_current_leader = (current_leader.get("node_id") == NODE_ID)
         is_current_leader_active = is_leader_active(doc)
 
+        # Get number of standby nodes for logging
+        standby_nodes_count = len(doc.get("standby_nodes", []))
+
         # Log detailed status
         logger.info(f"[LEADER STATUS] Forced leader: '{forced_leader}', This node is forced leader: {this_node_is_forced_leader}")
         logger.info(f"[LEADER STATUS] Current leader: '{current_leader_node_alias}', Active: {is_current_leader_active}")
+        logger.info(f"[LEADER STATUS] Standby nodes: {standby_nodes_count}")
         logger.info(f"[LEADER STATUS] This node: '{NODE_ALIAS}'")
 
         if force_check_only:
@@ -467,7 +570,11 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
 
         if this_node_is_forced_leader:
             # THIS NODE IS THE FORCED LEADER: take over UNCONDITIONALLY!
+            previous_leader_alias = current_leader_node_alias
             logger.info(f"[LEADER STATUS] This is the forced leader! Attempting to take over leadership...")
+            takeover_reason = "This node is the configured forced leader"
+            if previous_leader_alias and previous_leader_alias != NODE_ALIAS:
+                logger.warning(f"[LEADER STATUS] Taking over from previous leader: {previous_leader_alias}")
 
             update_modifier = {
                 "$set": {
@@ -489,8 +596,16 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                 return_document=pymongo.ReturnDocument.AFTER
             )
 
+            became_leader = result and result.get("current_leader", {}).get("node_id") == NODE_ID
+            if became_leader and not is_this_node_current_leader:
+                takeover_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                logger.info(f"🎉 [TAKEOVER COMPLETE!] Took over as leader at {takeover_time}")
+                logger.info(f"📋 [TAKEOVER DETAILS]:")
+                logger.info(f"   • Previous leader: {previous_leader_alias if previous_leader_alias else 'No previous leader'}")
+                logger.info(f"   • Reason: {takeover_reason}")
+
             db_disconnect_tracker = None
-            return result and result.get("current_leader", {}).get("node_id") == NODE_ID
+            return became_leader
 
         elif forced_leader:
             # THERE IS A FORCED LEADER, BUT IT'S NOT THIS NODE
@@ -501,6 +616,29 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             # NO FORCED LEADER: normal operation - only take over if no active leader
             if not is_current_leader_active or is_this_node_current_leader:
                 # Either no active leader, or we are already leader
+                previous_leader_alias = current_leader_node_alias
+                takeover_reason = ""
+                
+                if is_this_node_current_leader:
+                    takeover_reason = "Continuing as current leader"
+                elif not previous_leader_alias or previous_leader_alias == NODE_ALIAS:
+                    takeover_reason = "No active leader, claiming leadership"
+                else:
+                    last_heartbeat = current_leader.get("last_heartbeat")
+                    if last_heartbeat:
+                        try:
+                            if last_heartbeat.tzinfo is None:
+                                last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+                            time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
+                            takeover_reason = f"Previous leader {previous_leader_alias} heartbeat expired (last heartbeat: {last_heartbeat.strftime('%Y-%m-%d %H:%M:%S UTC')})"
+                        except Exception as e:
+                            takeover_reason = f"Previous leader {previous_leader_alias} heartbeat unreadable"
+                    else:
+                        takeover_reason = f"Previous leader {previous_leader_alias} has no heartbeat"
+                
+                if not is_this_node_current_leader:
+                    logger.warning(f"[LEADER STATUS] Previous leader {previous_leader_alias if previous_leader_alias else 'No leader'} - taking over")
+
                 filter_query = {
                     "_id": SERVICE_ID,
                     "$expr": {
@@ -535,8 +673,16 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                     return_document=pymongo.ReturnDocument.AFTER
                 )
 
+                became_leader = result and result.get("current_leader", {}).get("node_id") == NODE_ID
+                if became_leader and not is_this_node_current_leader:
+                    takeover_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    logger.info(f"🎉 [TAKEOVER COMPLETE!] Took over as leader at {takeover_time}")
+                    logger.info(f"📋 [TAKEOVER DETAILS]:")
+                    logger.info(f"   • Previous leader: {previous_leader_alias if previous_leader_alias else 'No previous leader'}")
+                    logger.info(f"   • Reason: {takeover_reason}")
+
                 db_disconnect_tracker = None
-                return result and result.get("current_leader", {}).get("node_id") == NODE_ID
+                return became_leader
             else:
                 return False
 
@@ -579,6 +725,7 @@ def main():
     is_leader = False
     local_failures = 0
     last_heartbeat_time = 0
+    last_standby_heartbeat_time = 0
 
     # MAIN LOOP
     while is_running:
@@ -586,6 +733,13 @@ def main():
             # --- STANDBY MONITORING LAYER ---
             if not is_leader:
                 logger.info(f"[STATUS] This node is standby, checking for leadership...")
+
+                # Update standby heartbeat if needed
+                current_time = time.time()
+                if current_time - last_standby_heartbeat_time >= HEARTBEAT_INTERVAL:
+                    update_standby_node_heartbeat()
+                    last_standby_heartbeat_time = current_time
+
                 if not try_acquire_or_maintain_leadership(update_telemetry=True):
                     time.sleep(CHECK_INTERVAL)
                     continue
@@ -596,8 +750,9 @@ def main():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                # We are now leader!
-                logger.info(f"🎉 SUCCESS: This node '{NODE_ALIAS}' captured distributed leadership! Transitioning to ACTIVE.")
+                # We are now leader! Remove self from standby nodes
+                remove_self_from_standby()
+
                 is_leader = True
                 local_failures = 0
 
@@ -697,6 +852,8 @@ def main():
     terminate_child()
     if is_leader:
         release_leadership()
+    else:
+        remove_self_from_standby()
     logger.info(f"[STATUS] Watchdog cleanup executed cleanly. Shutting down wrapper.")
 
 # Start the keep-alive web server (prevents platforms like Render from sleeping your app)
