@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 import pymongo
 from pymongo.errors import PyMongoError, ConnectionFailure, DuplicateKeyError
+from webserver import keep_alive
 
 # ---------------------------------------------------------------------------
 # 1. PERSISTENT GLOBAL MACHINE IDENTITY & MODE VECTOR INTERPRETATION
@@ -461,5 +462,6 @@ def main():
         release_leadership()
     logger.info("Watchdog cleanup executed cleanly. Shutting down wrapper.")
 
+keep_alive()
 if __name__ == "__main__":
     main()
