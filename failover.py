@@ -321,7 +321,6 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                         return False
                 except Exception as e:
                     logger.error(f"Error checking forced leader status: {e}")
-                    # If there's an error, don't step down
                     pass
             
             return is_owner
@@ -338,6 +337,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
         current_owner_active = False
         last_heartbeat = doc.get("last_heartbeat")
         owner_node_id = doc.get("owner_node_id")
+        current_owner_alias = doc.get("node_alias")
         if owner_node_id and last_heartbeat:
             try:
                 if last_heartbeat.tzinfo is None:
@@ -349,10 +349,17 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                 logger.error(f"Error checking current owner heartbeat: {e}")
                 current_owner_active = False
         
+        # Log detailed status
+        if forced_leader:
+            logger.info(f"[LEADER STATUS] Forced leader: '{forced_leader}', Active: {forced_leader_active}")
+        logger.info(f"[LEADER STATUS] Current leader: '{current_owner_alias}', Active: {current_owner_active}")
+        logger.info(f"[LEADER STATUS] This node: '{NODE_ALIAS}'")
+        
         # STRICT ATOMIC FILTER CONDITIONAL MATCHER:
         if forced_leader and forced_leader_active:
             # Only let forced leader take over if it's active
             if forced_leader != NODE_ALIAS:
+                logger.info(f"[LEADER STATUS] Waiting for forced leader '{forced_leader}' to take over")
                 return False
             filter_query = {"_id": SERVICE_ID, "forced_leader_node": NODE_ALIAS}
         else:
@@ -361,6 +368,8 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             # 2. Forced leader is inactive, OR
             # 3. Current owner's heartbeat is expired
             # Let anyone take over
+            if forced_leader and not forced_leader_active:
+                logger.info(f"[LEADER STATUS] Forced leader '{forced_leader}' is offline, allowing any node to take over")
             filter_query = {
                 "_id": SERVICE_ID,
                 "$expr": {
@@ -437,6 +446,7 @@ def main():
         try:
             # --- STANDBY MONITORING LAYER ---
             if not is_leader:
+                logger.info(f"[STATUS] This node is standby, checking for leadership...")
                 if not try_acquire_or_maintain_leadership(update_telemetry=True):
                     time.sleep(CHECK_INTERVAL)
                     continue
@@ -446,7 +456,7 @@ def main():
                     time.sleep(CHECK_INTERVAL)
                     continue
                     
-                logger.info("🎉 SUCCESS: Captured distributed leadership! Transitioning to ACTIVE.")
+                logger.info(f"🎉 SUCCESS: This node '{NODE_ALIAS}' captured distributed leadership! Transitioning to ACTIVE.")
                 is_leader = True
                 local_failures = 0
 
@@ -456,11 +466,11 @@ def main():
                     if child_process and child_process.poll() is not None:
                         exit_code = child_process.poll()
                         local_failures += 1
-                        logger.warning(f"Application crash caught (Code: {exit_code}). Failures: {local_failures}/{LOCAL_RETRY_LIMIT}")
+                        logger.warning(f"[BOT STATUS] Bot process crashed (Exit code: {exit_code}). Failures: {local_failures}/{LOCAL_RETRY_LIMIT}")
                         child_process = None
 
                         if local_failures > LOCAL_RETRY_LIMIT:
-                            logger.critical("Local recovery limit breached. Relinquishing leadership lock.")
+                            logger.critical(f"[BOT STATUS] Local recovery limit breached. Relinquishing leadership lock.")
                             terminate_child() 
                             release_leadership()
                             is_leader = False
@@ -468,11 +478,11 @@ def main():
                             continue
 
                     if not try_acquire_or_maintain_leadership():
-                        logger.warning("Split-brain caught during crash recovery phase. Reverting to standby.")
+                        logger.warning(f"[LEADER STATUS] Split-brain caught during crash recovery phase. Reverting to standby.")
                         is_leader = False
                         continue
 
-                    logger.info(f"Executing application array vector: {final_exec_args}")
+                    logger.info(f"[BOT STATUS] Starting bot process with: {final_exec_args}")
                     try:
                         if IS_WINDOWS:
                             child_process = subprocess.Popen(final_exec_args, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
@@ -482,19 +492,19 @@ def main():
                         time.sleep(STARTUP_GRACE_PERIOD)
                         
                         if child_process.poll() is not None:
-                            logger.error("Application died within the startup grace window.")
+                            logger.error(f"[BOT STATUS] Bot process died within startup grace window.")
                             continue
 
                         if try_acquire_or_maintain_leadership():
                             last_heartbeat_time = time.time()
-                            logger.info("Application passed initial checks. Heartbeat tracking active.")
+                            logger.info(f"[BOT STATUS] Bot passed initial checks. Heartbeat tracking active.")
                         else:
-                            logger.critical("Failed to retain lock during verification. Stopping application.")
+                            logger.critical(f"[LEADER STATUS] Failed to retain lock during verification. Stopping bot.")
                             terminate_child()
                             is_leader = False
                             continue
                     except Exception as e:
-                        logger.error(f"System failure attempting to initiate process target: {e}")
+                        logger.error(f"[BOT STATUS] System failure attempting to start bot: {e}")
                         child_process = None
                         time.sleep(CHECK_INTERVAL)
                         continue
@@ -504,7 +514,7 @@ def main():
                 
                 # Check for split-brain or manual override every second
                 if not try_acquire_or_maintain_leadership(force_check_only=True):
-                    logger.critical("🚨 STEPDOWN TRIGGERED: Node identity overtaken or manual override active! Stopping local application.")
+                    logger.critical(f"[LEADER STATUS] STEPDOWN TRIGGERED: Node identity overtaken or manual override active! Stopping bot.")
                     terminate_child()
                     is_leader = False
                     continue
@@ -512,29 +522,29 @@ def main():
                 if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                     if child_process.poll() is None:
                         if try_acquire_or_maintain_leadership(update_telemetry=False):
-                            logger.info("Heartbeat logged successfully via remote server clock.")
+                            logger.info(f"[HEARTBEAT] Heartbeat logged successfully.")
                             last_heartbeat_time = current_time
                             local_failures = 0 
                         else:
-                            logger.critical("🚨 LEASE LOST: Lock overridden during heartbeat update! Stopping application.")
+                            logger.critical(f"[LEADER STATUS] LEASE LOST: Lock overridden during heartbeat update! Stopping bot.")
                             terminate_child()
                             is_leader = False
                     else:
-                        logger.warning("Supervised process died inside the scheduled pulse window.")
+                        logger.warning(f"[BOT STATUS] Bot process died inside scheduled pulse window.")
 
                 time.sleep(1)
 
         except PyMongoError as e:
-            logger.error(f"Database infrastructure connectivity issue: {e}. Re-verifying pool...")
+            logger.error(f"[DATABASE] Database infrastructure connectivity issue: {e}. Re-verifying pool...")
             time.sleep(2)
         except Exception as e:
-            logger.error(f"Unhandled exception in runtime supervisor loop: {e}")
+            logger.error(f"[SYSTEM] Unhandled exception in runtime supervisor loop: {e}")
             time.sleep(2)
 
     terminate_child()
     if is_leader:
         release_leadership()
-    logger.info("Watchdog cleanup executed cleanly. Shutting down wrapper.")
+    logger.info(f"[STATUS] Watchdog cleanup executed cleanly. Shutting down wrapper.")
 
 # Bootstraps your keep-alive background thread metric routes automatically on loading
 keep_alive()
