@@ -1,3 +1,4 @@
+import os
 import requests
 import telebot
 import time
@@ -1076,9 +1077,9 @@ def manual_fetch(message):
 def send_logs(message):
     try:
         if str(message.chat.id) == config.OWNER_ID:
-            if os.path.exists(LOG_FILE):
+            if os.path.exists(logs.LOG_FILE):
                 try:
-                    with open(LOG_FILE, 'rb') as f:
+                    with open(logs.LOG_FILE, 'rb') as f:
                         bot.send_document(message.chat.id, f)
                 except Exception as e:
                     logs.write_log("ERROR", f"Error sending log file: {e}")
