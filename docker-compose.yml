@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: rf_bot_watchdog
+    container_name: rf_bot_container
     network_mode: "host"
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
