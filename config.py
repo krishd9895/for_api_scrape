@@ -39,7 +39,7 @@ RETRY_MINUTES = [17, 18, 19, 20, 21, 22]
 # Choose connection priority:
 # "proxy" - Try proxy connections first, fallback to direct
 # "direct" - Try direct connection first, fallback to proxies
-CONNECTION_PRIORITY = "proxy"
+CONNECTION_PRIORITY = "direct"
 
 # Maximum subscriptions per user
 MAX_SUBSCRIPTIONS_PER_USER = 4
