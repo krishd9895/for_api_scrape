@@ -322,7 +322,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             })
 
         result = db_collection.find_one_and_update(
-            filter_query, update_modifier, upsert=True, return_document=pymongo.ReturnDocument.AFTER
+            filter_query, update_modifier, upsert=False, return_document=pymongo.ReturnDocument.AFTER
         )
         db_disconnect_tracker = None 
         return result and result.get("owner_node_id") == NODE_ID
