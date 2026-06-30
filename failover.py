@@ -6,6 +6,22 @@
 # This script ensures your application (main.py by default) stays online 24/7
 # by using a distributed leadership lock via MongoDB.
 #
+# MONGODB DOCUMENT STRUCTURE:
+# {
+#   "_id": "RF_Bot",
+#   "current_leader": {
+#     "node_id": "uuid:/app",
+#     "node_alias": "hostname:hash",
+#     "status": "active", // "active" or "offline"
+#     "last_heartbeat": ISODate("..."),
+#     "hostname": "..."
+#   },
+#   "forced_leader": {
+#     "node_alias": "hostname:hash" // or null
+#   },
+#   "config_fingerprint": "..."
+# }
+#
 # FEATURES:
 # - Automatic failover: If the current leader goes offline, another node takes over
 # - Forced leader: You can force a specific node to be leader via MongoDB
@@ -19,11 +35,11 @@
 #
 # ADMINISTRATIVE OVERRIDE MANUAL:
 # - To force a specific node to be leader, update MongoDB:
-#   db.Services.updateOne({"_id": "RF_Bot"}, {"$set": {"forced_leader_node": "NODE_ALIAS"}})
+#   db.Services.updateOne({"_id": "RF_Bot"}, {"$set": {"forced_leader.node_alias": "NODE_ALIAS"}})
 # - To disable forced leader (let any node take over):
-#   db.Services.updateOne({"_id": "RF_Bot"}, {"$set": {"forced_leader_node": None}})
+#   db.Services.updateOne({"_id": "RF_Bot"}, {"$set": {"forced_leader.node_alias": null}})
 #   OR
-#   db.Services.updateOne({"_id": "RF_Bot"}, {"$set": {"forced_leader_node": ""}})
+#   db.Services.updateOne({"_id": "RF_Bot"}, {"$set": {"forced_leader.node_alias": ""}})
 # - (Find your explicit NODE_ALIAS printed directly inside the startup banner below)
 ###############################################################################
 """
@@ -291,29 +307,66 @@ def setup_database_indexes():
     Safe to run multiple times (idempotent).
     """
     try:
-        db_collection.create_index([("owner_node_id", pymongo.ASCENDING)], background=True)
+        db_collection.create_index([("current_leader.node_id", pymongo.ASCENDING)], background=True)
         return True
     except PyMongoError as e:
         logger.error(f"Failed to optimize indexing configuration: {e}")
         return False
 
+def get_normalized_forced_leader(doc):
+    """
+    Helper function to get normalized forced leader from document.
+    Treats empty string as None.
+    """
+    forced_leader = doc.get("forced_leader", {}).get("node_alias")
+    if forced_leader == "":
+        return None
+    return forced_leader
+
+def is_leader_active(doc):
+    """
+    Helper function to check if current leader is active
+    """
+    current_leader = doc.get("current_leader")
+    if not current_leader:
+        return False
+
+    last_heartbeat = current_leader.get("last_heartbeat")
+    if not last_heartbeat:
+        return False
+
+    try:
+        if last_heartbeat.tzinfo is None:
+            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+        time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
+        return time_since_heartbeat < HEARTBEAT_TIMEOUT
+    except Exception as e:
+        logger.error(f"Error checking leader heartbeat: {e}")
+        return False
+
 def bootstrap_and_validate_lock():
     """
     1. Creates the initial cluster control document in MongoDB if it doesn't exist
-    2. Normalizes forced_leader_node (treats empty string as None)
+    2. Normalizes forced_leader (treats empty string as None)
     3. Validates that all nodes are running the same configuration
     """
     try:
         doc = db_collection.find_one({"_id": SERVICE_ID})
-        
+
         if not doc:
             # Document doesn't exist yet - create it with default values
             initial_state = {
                 "_id": SERVICE_ID,
-                "owner_node_id": None,
-                "forced_leader_node": None,
-                "status": "offline",
-                "last_heartbeat": datetime.fromtimestamp(0, tz=timezone.utc),
+                "current_leader": {
+                    "node_id": None,
+                    "node_alias": None,
+                    "status": "offline",
+                    "last_heartbeat": datetime.fromtimestamp(0, tz=timezone.utc),
+                    "hostname": None
+                },
+                "forced_leader": {
+                    "node_alias": None
+                },
                 "config_fingerprint": CONFIG_FINGERPRINT
             }
             try:
@@ -321,23 +374,23 @@ def bootstrap_and_validate_lock():
                 logger.info("Successfully bootstrapped the missing cluster control record.")
             except DuplicateKeyError:
                 # Another node just created it - that's okay
-                pass 
+                pass
         else:
-            # Document exists - normalize forced_leader_node if needed
-            fl = doc.get("forced_leader_node")
-            if fl == "":
-                # Convert empty string to None for consistency
-                logger.info(f"Normalizing forced_leader_node from empty string to None")
+            # Document exists - normalize forced_leader if needed
+            forced_leader = get_normalized_forced_leader(doc)
+            doc_forced_leader = doc.get("forced_leader", {}).get("node_alias")
+            if doc_forced_leader == "":
+                logger.info(f"Normalizing forced_leader from empty string to None")
                 db_collection.update_one(
                     {"_id": SERVICE_ID},
-                    {"$set": {"forced_leader_node": None}}
+                    {"$set": {"forced_leader.node_alias": None}}
                 )
 
         # Verify that all nodes are running the same configuration
         if doc and doc.get("config_fingerprint") != CONFIG_FINGERPRINT:
             logger.critical("🚨 CONFIGURATION FINGERPRINT MISMATCH! Execution immediately halted.")
             sys.exit(1)
-        
+
         return True
 
     except (ConnectionFailure, PyMongoError) as e:
@@ -347,18 +400,17 @@ def bootstrap_and_validate_lock():
 
 def release_leadership():
     """
-    Voluntarily step down as leader:
-    1. Clears owner_node_id
-    2. Sets status to "offline"
-    3. Resets last_heartbeat to epoch
+    Voluntarily step down as leader
     """
     try:
-        query = {"_id": SERVICE_ID, "owner_node_id": NODE_ID}
+        query = {"_id": SERVICE_ID, "current_leader.node_id": NODE_ID}
         update = {
             "$set": {
-                "owner_node_id": None,
-                "status": "offline",
-                "last_heartbeat": datetime.fromtimestamp(0, tz=timezone.utc)
+                "current_leader.node_id": None,
+                "current_leader.node_alias": None,
+                "current_leader.status": "offline",
+                "current_leader.last_heartbeat": datetime.fromtimestamp(0, tz=timezone.utc),
+                "current_leader.hostname": None
             }
         }
         db_collection.update_one(query, update)
@@ -372,7 +424,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
 
     Args:
         force_check_only: Just check if we should still be leader (don't try to acquire)
-        update_telemetry: Update extra fields (project_path, node_alias, etc.) when we become leader
+        update_telemetry: Update extra fields (hostname, etc.) when we become leader
 
     Returns:
         True if we are the current leader, False otherwise
@@ -384,164 +436,109 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
         if not doc:
             return False
 
-        # Get forced leader and normalize it (treat empty string as None)
-        forced_leader = doc.get("forced_leader_node")
-        if forced_leader == "":
-            forced_leader = None
+        # Get normalized forced leader
+        forced_leader = get_normalized_forced_leader(doc)
         this_node_is_forced_leader = (forced_leader == NODE_ALIAS)
+
+        # Get current leader info
+        current_leader = doc.get("current_leader", {})
+        current_leader_node_alias = current_leader.get("node_alias")
+        is_this_node_current_leader = (current_leader.get("node_id") == NODE_ID)
+        is_current_leader_active = is_leader_active(doc)
+
+        # Log detailed status
+        logger.info(f"[LEADER STATUS] Forced leader: '{forced_leader}', This node is forced leader: {this_node_is_forced_leader}")
+        logger.info(f"[LEADER STATUS] Current leader: '{current_leader_node_alias}', Active: {is_current_leader_active}")
+        logger.info(f"[LEADER STATUS] This node: '{NODE_ALIAS}'")
 
         if force_check_only:
             # We are already leader - just check if we should stay leader
-            db_disconnect_tracker = None 
-            is_owner = (doc.get("owner_node_id") == NODE_ID)
+            db_disconnect_tracker = None
 
-            if is_owner and forced_leader and not this_node_is_forced_leader:
-                # We are active, but not the forced leader
-                # Check two things:
-                # 1. Is the document's node_alias the forced leader?
-                # 2. Or is forced leader the one with the recent heartbeat?
-                doc_node_alias = doc.get("node_alias")
-                last_heartbeat = doc.get("last_heartbeat")
-                forced_leader_is_active = False
-
-                if doc_node_alias == forced_leader:
-                    # Document is already from forced leader - definitely step down
-                    forced_leader_is_active = True
-                elif last_heartbeat:
-                    try:
-                        if last_heartbeat.tzinfo is None:
-                            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
-                        time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
-                        if time_since_heartbeat < HEARTBEAT_TIMEOUT:
-                            forced_leader_is_active = True
-                    except Exception as e:
-                        logger.error(f"Error checking forced leader heartbeat: {e}")
-                        forced_leader_is_active = False
-
-                if forced_leader_is_active:
-                    logger.warning(f"[LEADER STATUS] Administrative override active! Forced leader '{forced_leader}' is back online. Stepping down.")
+            if is_this_node_current_leader:
+                # Check if there is a forced leader that is NOT us
+                if forced_leader and not this_node_is_forced_leader:
+                    logger.warning(f"[LEADER STATUS] Administrative override active! Forced leader '{forced_leader}' is set. Stepping down.")
                     return False
-
-            return is_owner
+                return True
+            return False
 
         # --- NOT FORCE CHECK ONLY: TRY TO ACQUIRE OR MAINTAIN LEADERSHIP ---
 
-        # Get current leader state
-        current_owner_alias = doc.get("node_alias")
-        last_heartbeat = doc.get("last_heartbeat")
-        current_owner_active = False
-
-        # Is the current owner still active?
-        if doc.get("owner_node_id") and last_heartbeat:
-            try:
-                if last_heartbeat.tzinfo is None:
-                    last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
-                time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
-                if time_since_heartbeat < HEARTBEAT_TIMEOUT:
-                    current_owner_active = True
-            except Exception as e:
-                logger.error(f"Error checking current owner heartbeat: {e}")
-                current_owner_active = False
-
-        # Log detailed status
-        if forced_leader:
-            logger.info(f"[LEADER STATUS] Forced leader: '{forced_leader}', This node is forced leader: {this_node_is_forced_leader}")
-        logger.info(f"[LEADER STATUS] Current leader: '{current_owner_alias}', Active: {current_owner_active}")
-        logger.info(f"[LEADER STATUS] This node: '{NODE_ALIAS}'")
-
-        # Determine what filter to use for MongoDB update
         if this_node_is_forced_leader:
             # THIS NODE IS THE FORCED LEADER: take over UNCONDITIONALLY!
             logger.info(f"[LEADER STATUS] This is the forced leader! Attempting to take over leadership...")
-            filter_query = {
-                "_id": SERVICE_ID  # Match the document no matter what state it's in
+
+            update_modifier = {
+                "$set": {
+                    "current_leader.node_id": NODE_ID,
+                    "current_leader.node_alias": NODE_ALIAS,
+                    "current_leader.status": "active",
+                    "current_leader.hostname": HOSTNAME,
+                    "config_fingerprint": CONFIG_FINGERPRINT
+                },
+                "$currentDate": {
+                    "current_leader.last_heartbeat": True
+                }
             }
+
+            result = db_collection.find_one_and_update(
+                {"_id": SERVICE_ID},  # Match the document no matter what
+                update_modifier,
+                upsert=False,
+                return_document=pymongo.ReturnDocument.AFTER
+            )
+
+            db_disconnect_tracker = None
+            return result and result.get("current_leader", {}).get("node_id") == NODE_ID
+
         elif forced_leader:
             # THERE IS A FORCED LEADER, BUT IT'S NOT THIS NODE
-            forced_leader_is_active = False
-            doc_node_alias = doc.get("node_alias")
+            logger.info(f"[LEADER STATUS] Waiting for forced leader '{forced_leader}' to become active")
+            return False
 
-            # Check if forced leader is the one in the document and has active heartbeat
-            if doc_node_alias == forced_leader:
-                if doc.get("status") == "active":
-                    forced_leader_is_active = True
-                elif last_heartbeat:
-                    try:
-                        if last_heartbeat.tzinfo is None:
-                            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
-                        time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
-                        if time_since_heartbeat < HEARTBEAT_TIMEOUT:
-                            forced_leader_is_active = True
-                    except Exception as e:
-                        logger.error(f"Error checking forced leader heartbeat: {e}")
-                        forced_leader_is_active = False
-
-            if forced_leader_is_active:
-                # Forced leader is active - wait for it
-                logger.info(f"[LEADER STATUS] Waiting for forced leader '{forced_leader}' to be active")
-                return False
-            else:
-                # Forced leader is NOT active - anyone can take over!
-                logger.info(f"[LEADER STATUS] Forced leader '{forced_leader}' is offline, allowing any node to take over")
+        else:
+            # NO FORCED LEADER: normal operation - only take over if no active leader
+            if not is_current_leader_active or is_this_node_current_leader:
+                # Either no active leader, or we are already leader
                 filter_query = {
                     "_id": SERVICE_ID,
                     "$expr": {
                         "$or": [
-                            {"$eq": ["$owner_node_id", NODE_ID]},
-                            {"$eq": ["$owner_node_id", None]},
+                            {"$eq": ["$current_leader.node_id", NODE_ID]},
+                            {"$eq": ["$current_leader.node_id", None]},
                             {"$gt": [
-                                "$$NOW", 
-                                {"$add": ["$last_heartbeat", HEARTBEAT_TIMEOUT * 1000]}
+                                "$$NOW",
+                                {"$add": ["$current_leader.last_heartbeat", HEARTBEAT_TIMEOUT * 1000]}
                             ]}
                         ]
                     }
                 }
-        else:
-            # NO FORCED LEADER: normal operation
-            filter_query = {
-                "_id": SERVICE_ID,
-                "$expr": {
-                    "$or": [
-                        {"$eq": ["$owner_node_id", NODE_ID]},
-                        {"$eq": ["$owner_node_id", None]},
-                        {"$gt": [
-                            "$$NOW", 
-                            {"$add": ["$last_heartbeat", HEARTBEAT_TIMEOUT * 1000]}
-                        ]}
-                    ]
+
+                update_modifier = {
+                    "$set": {
+                        "current_leader.node_id": NODE_ID,
+                        "current_leader.node_alias": NODE_ALIAS,
+                        "current_leader.status": "active",
+                        "current_leader.hostname": HOSTNAME,
+                        "config_fingerprint": CONFIG_FINGERPRINT
+                    },
+                    "$currentDate": {
+                        "current_leader.last_heartbeat": True
+                    }
                 }
-            }
 
-        # Build the update document
-        update_modifier = {
-            "$set": {
-                "owner_node_id": NODE_ID,
-                "status": "active",
-                "config_fingerprint": CONFIG_FINGERPRINT
-            },
-            "$currentDate": {
-                "last_heartbeat": True  # Set last_heartbeat to current time (MongoDB server time)
-            }
-        }
+                result = db_collection.find_one_and_update(
+                    filter_query,
+                    update_modifier,
+                    upsert=False,
+                    return_document=pymongo.ReturnDocument.AFTER
+                )
 
-        # Add extra telemetry data if requested
-        if update_telemetry:
-            update_modifier["$set"].update({
-                "project_path": PROJECT_PATH,
-                "launch_mode": LAUNCH_MODE,
-                "node_alias": NODE_ALIAS,
-                "context": IDE_CONTEXT,
-                "hostname": HOSTNAME
-            })
-
-        # Execute the atomic findOneAndUpdate!
-        # This is the magic: only one node will successfully update the document
-        result = db_collection.find_one_and_update(
-            filter_query, update_modifier, upsert=False, return_document=pymongo.ReturnDocument.AFTER
-        )
-
-        db_disconnect_tracker = None 
-        return result and result.get("owner_node_id") == NODE_ID
+                db_disconnect_tracker = None
+                return result and result.get("current_leader", {}).get("node_id") == NODE_ID
+            else:
+                return False
 
     except (ConnectionFailure, PyMongoError) as e:
         logger.error(f"Database network communication fault: {e}")
@@ -552,8 +549,8 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
 
         # If we've been disconnected too long, step down
         if (time.time() - db_disconnect_tracker) > MAX_NETWORK_GRACE_S:
-            logger.critical(f"🚨 CIRCUIT BREAKER TRIPPED: DB offline >{MAX_NETWORK_GRACE_S}s. Dropping lease.")
-            return False 
+            logger.critical(f"🚨 CIRCUIT BREAKER TRIPPED! DB offline >{MAX_NETWORK_GRACE_S}s. Dropping lease.")
+            return False
 
         return True
 
@@ -567,7 +564,7 @@ def main():
     print(f"======================================================================", flush=True)
     print(f"🔥 HA PROCESS WATCHDOG ACTIVE | Mode: {LAUNCH_MODE}", flush=True)
     print(f"Service ID : {SERVICE_ID}", flush=True)
-    print(f"NODE ALIAS : {NODE_ALIAS}", flush=True) 
+    print(f"NODE ALIAS : {NODE_ALIAS}", flush=True)
     print(f"Vector     : {final_exec_args}", flush=True)
     print(f"======================================================================\n", flush=True)
 
@@ -618,7 +615,7 @@ def main():
                         # If we've failed too many times, give up and step down
                         if local_failures > LOCAL_RETRY_LIMIT:
                             logger.critical(f"[BOT STATUS] Local recovery limit breached. Relinquishing leadership lock.")
-                            terminate_child() 
+                            terminate_child()
                             release_leadership()
                             is_leader = False
                             time.sleep(CHECK_INTERVAL)
@@ -643,7 +640,7 @@ def main():
 
                         # Check if app crashed during startup
                         if child_process.poll() is not None:
-                            logger.error(f"[BOT STATUS] Bot process died within startup grace window.")
+                            logger.error(f"[BOT STATUS] Bot process died during startup grace window.")
                             continue
 
                         # Verify we still have leadership after startup
@@ -666,8 +663,9 @@ def main():
 
                 # Check every second if we should still be leader
                 if not try_acquire_or_maintain_leadership(force_check_only=True):
-                    logger.critical(f"[LEADER STATUS] STEPDOWN TRIGGERED: Node identity overtaken or manual override active! Stopping bot.")
+                    logger.critical(f"[LEADER STATUS] STEPDOWN TRIGGERED! Node identity overtaken or manual override active. Stopping bot.")
                     terminate_child()
+                    release_leadership()
                     is_leader = False
                     continue
 
@@ -677,10 +675,11 @@ def main():
                         if try_acquire_or_maintain_leadership(update_telemetry=False):
                             logger.info(f"[HEARTBEAT] Heartbeat logged successfully.")
                             last_heartbeat_time = current_time
-                            local_failures = 0 
+                            local_failures = 0
                         else:
-                            logger.critical(f"[LEADER STATUS] LEASE LOST: Lock overridden during heartbeat update! Stopping bot.")
+                            logger.critical(f"[LEADER STATUS] LEASE LOST! Lock overridden during heartbeat update. Stopping bot.")
                             terminate_child()
+                            release_leadership()
                             is_leader = False
                     else:
                         logger.warning(f"[BOT STATUS] Bot process died inside scheduled pulse window.")
