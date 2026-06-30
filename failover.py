@@ -396,25 +396,27 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             is_owner = (doc.get("owner_node_id") == NODE_ID)
 
             if is_owner and forced_leader and not this_node_is_forced_leader:
-                # We are active, but not the forced leader - check if forced leader is back online
+                # We are active, but not the forced leader
+                # Check two things:
+                # 1. Is the document's node_alias the forced leader?
+                # 2. Or is forced leader the one with the recent heartbeat?
                 doc_node_alias = doc.get("node_alias")
                 last_heartbeat = doc.get("last_heartbeat")
                 forced_leader_is_active = False
 
                 if doc_node_alias == forced_leader:
-                    # Forced leader was the last one in the document
-                    if doc.get("status") == "active":
-                        forced_leader_is_active = True
-                    elif last_heartbeat:
-                        try:
-                            if last_heartbeat.tzinfo is None:
-                                last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
-                            time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
-                            if time_since_heartbeat < HEARTBEAT_TIMEOUT:
-                                forced_leader_is_active = True
-                        except Exception as e:
-                            logger.error(f"Error checking forced leader heartbeat: {e}")
-                            forced_leader_is_active = False
+                    # Document is already from forced leader - definitely step down
+                    forced_leader_is_active = True
+                elif last_heartbeat:
+                    try:
+                        if last_heartbeat.tzinfo is None:
+                            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+                        time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
+                        if time_since_heartbeat < HEARTBEAT_TIMEOUT:
+                            forced_leader_is_active = True
+                    except Exception as e:
+                        logger.error(f"Error checking forced leader heartbeat: {e}")
+                        forced_leader_is_active = False
 
                 if forced_leader_is_active:
                     logger.warning(f"[LEADER STATUS] Administrative override active! Forced leader '{forced_leader}' is back online. Stepping down.")
@@ -449,27 +451,17 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
 
         # Determine what filter to use for MongoDB update
         if this_node_is_forced_leader:
-            # THIS NODE IS THE FORCED LEADER: try to take over NO MATTER WHAT!
+            # THIS NODE IS THE FORCED LEADER: take over UNCONDITIONALLY!
             logger.info(f"[LEADER STATUS] This is the forced leader! Attempting to take over leadership...")
             filter_query = {
-                "_id": SERVICE_ID,
-                "$or": [
-                    {"owner_node_id": NODE_ID},                    # We already own it
-                    {"owner_node_id": None},                      # No one owns it
-                    {"$expr": {                                    # Current owner's heartbeat expired
-                        "$gt": [
-                            "$$NOW", 
-                            {"$add": ["$last_heartbeat", HEARTBEAT_TIMEOUT * 1000]}
-                        ]
-                    }}
-                ]
+                "_id": SERVICE_ID  # Match the document no matter what state it's in
             }
         elif forced_leader:
             # THERE IS A FORCED LEADER, BUT IT'S NOT THIS NODE
             forced_leader_is_active = False
             doc_node_alias = doc.get("node_alias")
 
-            # Check if forced leader is currently active
+            # Check if forced leader is the one in the document and has active heartbeat
             if doc_node_alias == forced_leader:
                 if doc.get("status") == "active":
                     forced_leader_is_active = True
@@ -489,7 +481,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                 logger.info(f"[LEADER STATUS] Waiting for forced leader '{forced_leader}' to be active")
                 return False
             else:
-                # Forced leader is offline - any node can take over!
+                # Forced leader is NOT active - anyone can take over!
                 logger.info(f"[LEADER STATUS] Forced leader '{forced_leader}' is offline, allowing any node to take over")
                 filter_query = {
                     "_id": SERVICE_ID,
