@@ -1,12 +1,20 @@
 import os
 from datetime import timezone, timedelta
+from pathlib import Path
+
 try:
     from dotenv import load_dotenv
-    # Load environment variables from .env file if it exists
-    load_dotenv()
+    # Load environment variables from .env file in the same directory as config.py
+    config_dir = Path(__file__).resolve().parent
+    env_path = config_dir / '.env'
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+        print(f"Loaded environment variables from {env_path}")
+    else:
+        print(f".env file not found at {env_path}, using system environment variables")
 except ImportError:
     # If python-dotenv is not installed, just use the system environment variables
-    pass
+    print("python-dotenv not installed, using system environment variables")
 
 # Configuration file for weather bot
 
