@@ -46,3 +46,6 @@ CONNECTION_PRIORITY = "proxy"
 
 # Maximum subscriptions per user
 MAX_SUBSCRIPTIONS_PER_USER = 4
+
+# Print config values for debugging
+print(f"[config.py] PORT = {PORT}")
