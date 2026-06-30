@@ -1,0 +1,15 @@
+services:
+  rf_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rf_bot_watchdog
+    network_mode: "host"
+    environment:
+      - MONGO_URI=${MONGO_URI}
+    restart: "on-failure"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
