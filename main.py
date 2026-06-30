@@ -55,7 +55,7 @@ URL_PREFIX = os.environ.get('URL_PREFIX')
 MAX_SUBSCRIPTIONS_PER_USER = 4
 
 # Configuration: Choose "direct" for direct first, "proxy" for proxy first (default)
-CONNECTION_PRIORITY = "proxy"  # Options: "direct" or "proxy"
+CONNECTION_PRIORITY = "direct"  # Options: "direct" or "proxy"
 
 # Indian timezone (UTC+5:30)
 INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
