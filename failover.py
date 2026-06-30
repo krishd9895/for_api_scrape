@@ -21,7 +21,7 @@ TARGET = "main.py"           # PYTHON: "main.py"/"bot.py" | DOCKER_COMPOSE: "-f 
 CUSTOM_RAW_COMMAND = ""      # Used ONLY if LAUNCH_MODE is set to "RAW"
 
 # --- Infrastructure & Distributed Lock Properties ---
-SERVICE_ID = "telegram-bot-cluster"   # MANDATORY: Explicit unique cluster lock key
+SERVICE_ID = "RF_Bot"   # MANDATORY: Explicit unique cluster lock key
 DATABASE_NAME = "Failover"
 COLLECTION_NAME = "Services"
 
