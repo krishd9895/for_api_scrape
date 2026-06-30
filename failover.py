@@ -353,6 +353,19 @@ def is_leader_active(doc):
         logger.error(f"Error checking leader heartbeat: {e}")
         return False
 
+def is_forced_leader_currently_active(doc, forced_leader_node_alias):
+    """
+    Check if the forced leader node is currently active and has a valid heartbeat
+    """
+    if not forced_leader_node_alias:
+        return False
+
+    current_leader = doc.get("current_leader", {})
+    if current_leader.get("node_alias") != forced_leader_node_alias:
+        return False
+
+    return is_leader_active(doc)
+
 def remove_stale_standby_nodes(doc):
     """
     Remove standby nodes that haven't sent a heartbeat in HEARTBEAT_TIMEOUT seconds
@@ -607,21 +620,26 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             db_disconnect_tracker = None
             return became_leader
 
-        elif forced_leader:
-            # THERE IS A FORCED LEADER, BUT IT'S NOT THIS NODE
-            logger.info(f"[LEADER STATUS] Waiting for forced leader '{forced_leader}' to become active")
-            return False
+        # Check if forced leader is set and active - if yes, return false
+        if forced_leader:
+            is_fl_active = is_forced_leader_currently_active(doc, forced_leader)
+            if is_fl_active:
+                logger.info(f"[LEADER STATUS] Waiting for forced leader '{forced_leader}' - it's currently active")
+                return False
+            else:
+                logger.warning(f"[LEADER STATUS] Forced leader '{forced_leader}' is offline! Any node can take over!")
 
-        else:
-            # NO FORCED LEADER: normal operation - only take over if no active leader
+        # Now handle cases where we might take over (either no forced leader or forced leader is offline)
+        # Determine if we should attempt takeover
+        should_attempt_takeover = False
+        takeover_reason = ""
+        if not forced_leader:
+            # No forced leader, check normal conditions
             if not is_current_leader_active or is_this_node_current_leader:
-                # Either no active leader, or we are already leader
-                previous_leader_alias = current_leader_node_alias
-                takeover_reason = ""
-                
+                should_attempt_takeover = True
                 if is_this_node_current_leader:
                     takeover_reason = "Continuing as current leader"
-                elif not previous_leader_alias or previous_leader_alias == NODE_ALIAS:
+                elif not current_leader_node_alias or current_leader_node_alias == NODE_ALIAS:
                     takeover_reason = "No active leader, claiming leadership"
                 else:
                     last_heartbeat = current_leader.get("last_heartbeat")
@@ -630,61 +648,83 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                             if last_heartbeat.tzinfo is None:
                                 last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
                             time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
-                            takeover_reason = f"Previous leader {previous_leader_alias} heartbeat expired (last heartbeat: {last_heartbeat.strftime('%Y-%m-%d %H:%M:%S UTC')})"
+                            takeover_reason = f"Previous leader {current_leader_node_alias} heartbeat expired (last heartbeat: {last_heartbeat.strftime('%Y-%m-%d %H:%M:%S UTC')})"
                         except Exception as e:
-                            takeover_reason = f"Previous leader {previous_leader_alias} heartbeat unreadable"
+                            takeover_reason = f"Previous leader {current_leader_node_alias} heartbeat unreadable"
                     else:
-                        takeover_reason = f"Previous leader {previous_leader_alias} has no heartbeat"
-                
-                if not is_this_node_current_leader:
-                    logger.warning(f"[LEADER STATUS] Previous leader {previous_leader_alias if previous_leader_alias else 'No leader'} - taking over")
+                        takeover_reason = f"Previous leader {current_leader_node_alias} has no heartbeat"
+        else:
+            # There is a forced leader but it's not active
+            if not is_current_leader_active or is_this_node_current_leader:
+                should_attempt_takeover = True
+                if is_this_node_current_leader:
+                    takeover_reason = "Continuing as current leader (forced leader is offline)"
+                elif not current_leader_node_alias or current_leader_node_alias == NODE_ALIAS:
+                    takeover_reason = "Forced leader is offline, no active leader, claiming leadership"
+                else:
+                    last_heartbeat = current_leader.get("last_heartbeat")
+                    if last_heartbeat:
+                        try:
+                            if last_heartbeat.tzinfo is None:
+                                last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+                            time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
+                            takeover_reason = f"Forced leader {forced_leader} is offline! Previous leader {current_leader_node_alias} heartbeat expired (last heartbeat: {last_heartbeat.strftime('%Y-%m-%d %H:%M:%S UTC')})"
+                        except Exception as e:
+                            takeover_reason = f"Forced leader {forced_leader} is offline! Previous leader {current_leader_node_alias} heartbeat unreadable"
+                    else:
+                        takeover_reason = f"Forced leader {forced_leader} is offline! Previous leader {current_leader_node_alias} has no heartbeat"
 
-                filter_query = {
-                    "_id": SERVICE_ID,
-                    "$expr": {
-                        "$or": [
-                            {"$eq": ["$current_leader.node_id", NODE_ID]},
-                            {"$eq": ["$current_leader.node_id", None]},
-                            {"$gt": [
-                                "$$NOW",
-                                {"$add": ["$current_leader.last_heartbeat", HEARTBEAT_TIMEOUT * 1000]}
-                            ]}
-                        ]
-                    }
+        if should_attempt_takeover:
+            previous_leader_alias = current_leader_node_alias
+            if not is_this_node_current_leader:
+                logger.warning(f"[LEADER STATUS] Previous leader {previous_leader_alias if previous_leader_alias else 'No leader'} - taking over")
+
+            filter_query = {
+                "_id": SERVICE_ID,
+                "$expr": {
+                    "$or": [
+                        {"$eq": ["$current_leader.node_id", NODE_ID]},
+                        {"$eq": ["$current_leader.node_id", None]},
+                        {"$gt": [
+                            "$$NOW",
+                            {"$add": ["$current_leader.last_heartbeat", HEARTBEAT_TIMEOUT * 1000]}
+                        ]}
+                    ]
                 }
+            }
 
-                update_modifier = {
-                    "$set": {
-                        "current_leader.node_id": NODE_ID,
-                        "current_leader.node_alias": NODE_ALIAS,
-                        "current_leader.status": "active",
-                        "current_leader.hostname": HOSTNAME,
-                        "config_fingerprint": CONFIG_FINGERPRINT
-                    },
-                    "$currentDate": {
-                        "current_leader.last_heartbeat": True
-                    }
+            update_modifier = {
+                "$set": {
+                    "current_leader.node_id": NODE_ID,
+                    "current_leader.node_alias": NODE_ALIAS,
+                    "current_leader.status": "active",
+                    "current_leader.hostname": HOSTNAME,
+                    "config_fingerprint": CONFIG_FINGERPRINT
+                },
+                "$currentDate": {
+                    "current_leader.last_heartbeat": True
                 }
+            }
 
-                result = db_collection.find_one_and_update(
-                    filter_query,
-                    update_modifier,
-                    upsert=False,
-                    return_document=pymongo.ReturnDocument.AFTER
-                )
+            result = db_collection.find_one_and_update(
+                filter_query,
+                update_modifier,
+                upsert=False,
+                return_document=pymongo.ReturnDocument.AFTER
+            )
 
-                became_leader = result and result.get("current_leader", {}).get("node_id") == NODE_ID
-                if became_leader and not is_this_node_current_leader:
-                    takeover_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    logger.info(f"🎉 [TAKEOVER COMPLETE!] Took over as leader at {takeover_time}")
-                    logger.info(f"📋 [TAKEOVER DETAILS]:")
-                    logger.info(f"   • Previous leader: {previous_leader_alias if previous_leader_alias else 'No previous leader'}")
-                    logger.info(f"   • Reason: {takeover_reason}")
+            became_leader = result and result.get("current_leader", {}).get("node_id") == NODE_ID
+            if became_leader and not is_this_node_current_leader:
+                takeover_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                logger.info(f"🎉 [TAKEOVER COMPLETE!] Took over as leader at {takeover_time}")
+                logger.info(f"📋 [TAKEOVER DETAILS]:")
+                logger.info(f"   • Previous leader: {previous_leader_alias if previous_leader_alias else 'No previous leader'}")
+                logger.info(f"   • Reason: {takeover_reason}")
 
-                db_disconnect_tracker = None
-                return became_leader
-            else:
-                return False
+            db_disconnect_tracker = None
+            return became_leader
+        else:
+            return False
 
     except (ConnectionFailure, PyMongoError) as e:
         logger.error(f"Database network communication fault: {e}")
