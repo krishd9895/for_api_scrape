@@ -54,6 +54,9 @@ URL_PREFIX = os.environ.get('URL_PREFIX')
 # Maximum subscriptions per user
 MAX_SUBSCRIPTIONS_PER_USER = 4
 
+# Configuration: Choose "direct" for direct first, "proxy" for proxy first (default)
+CONNECTION_PRIORITY = "proxy"  # Options: "direct" or "proxy"
+
 # Indian timezone (UTC+5:30)
 INDIAN_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
@@ -489,45 +492,10 @@ def check_proxies_and_fetch(url,
                             is_manual=False,
                             suffix=None):
     proxies_data = load_proxies()
-
-    # Check if proxies data is valid
-    if not proxies_data or "proxies" not in proxies_data or not isinstance(
-            proxies_data["proxies"], list):
-        error_msg = "Proxies configuration is invalid or empty."
-        write_log("ERROR", "Proxies configuration is empty or invalid structure")
-
-        if str(chat_id) != OWNER_ID:
-            bot.send_message(
-                OWNER_ID,
-                "🚨 Proxies configuration is invalid or empty. Check MongoDB proxy configuration."
-            )
-
-        # Try direct request as fallback
-        write_log("INFO", "Attempting direct request without proxy")
-        table_data, error = fetch_table_data_direct(url)
-
-        if table_data:
-            formatted_data = format_table_data(table_data, suffix)
-            if message_id:
-                try:
-                    bot.edit_message_text(formatted_data,
-                                          chat_id,
-                                          message_id,
-                                          parse_mode='HTML')
-                except Exception as e:
-                    bot.send_message(chat_id,
-                                     formatted_data,
-                                     parse_mode='HTML')
-            else:
-                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
-            write_log("INFO", "Direct request SUCCESS")
-            return True
-        else:
-            write_log("ERROR", f"Direct request also failed: {error}")
-            return False
-
-    proxies = proxies_data["proxies"]
-    success = False
+    valid_proxies_available = False
+    
+    if proxies_data and "proxies" in proxies_data and isinstance(proxies_data["proxies"], list) and proxies_data["proxies"]:
+        valid_proxies_available = True
 
     # Send acknowledgment message for manual fetch
     if is_manual and not message_id:
@@ -535,15 +503,10 @@ def check_proxies_and_fetch(url,
                                    "🔄 Fetching latest weather data...")
         message_id = ack_msg.message_id
 
-    # Check if there are any proxies to use
-    if not proxies:
-        error_msg = "No proxies available in configuration."
-        write_log("ERROR", "Proxies list is empty")
-
-        # Try direct request as fallback
-        write_log("INFO", "No proxies available, attempting direct request")
+    # Check if we should try direct first
+    if CONNECTION_PRIORITY == "direct":
+        write_log("INFO", "Trying direct request first (as per CONNECTION_PRIORITY)")
         table_data, error = fetch_table_data_direct(url)
-
         if table_data:
             formatted_data = format_table_data(table_data, suffix)
             if message_id:
@@ -558,51 +521,52 @@ def check_proxies_and_fetch(url,
                                      parse_mode='HTML')
             else:
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
-            write_log("INFO", "Direct request SUCCESS")
+            write_log("INFO", "Direct request SUCCESS (first attempt)")
             return True
         else:
-            write_log("ERROR", f"Direct request also failed: {error}")
-            return False
+            write_log("ERROR", f"Direct request failed: {error}")
+            if not valid_proxies_available:
+                return False
+            write_log("INFO", "Falling back to proxies")
 
-    # Try each proxy
-    for proxy_entry in proxies:
-        try:
-            if ':' not in proxy_entry:
-                write_log("ERROR", f"Invalid proxy format: {proxy_entry}")
-                continue
+    # Try proxies (either first or as fallback)
+    if valid_proxies_available:
+        proxies = proxies_data["proxies"]
+        for proxy_entry in proxies:
+            try:
+                if ':' not in proxy_entry:
+                    write_log("ERROR", f"Invalid proxy format: {proxy_entry}")
+                    continue
 
-            proxy, scheme = proxy_entry.rsplit(':', 1)
-            table_data, error = fetch_table_data(url, proxy, scheme)
+                proxy, scheme = proxy_entry.rsplit(':', 1)
+                table_data, error = fetch_table_data(url, proxy, scheme)
 
-            if table_data:
-                success = True
-                formatted_data = format_table_data(table_data, suffix)
-
-                if message_id:
-                    try:
-                        bot.edit_message_text(formatted_data,
-                                              chat_id,
-                                              message_id,
-                                              parse_mode='HTML')
-                    except Exception as e:
+                if table_data:
+                    formatted_data = format_table_data(table_data, suffix)
+                    if message_id:
+                        try:
+                            bot.edit_message_text(formatted_data,
+                                                  chat_id,
+                                                  message_id,
+                                                  parse_mode='HTML')
+                        except Exception as e:
+                            bot.send_message(chat_id,
+                                             formatted_data,
+                                             parse_mode='HTML')
+                    else:
                         bot.send_message(chat_id,
                                          formatted_data,
                                          parse_mode='HTML')
+                    write_log("INFO", f"Proxy {proxy} ({scheme}) SUCCESS")
+                    return True
                 else:
-                    bot.send_message(chat_id,
-                                     formatted_data,
-                                     parse_mode='HTML')
+                    write_log("ERROR", f"Proxy {proxy} ({scheme}) failed: {error}")
+            except Exception as e:
+                write_log("ERROR", f"Error processing proxy {proxy_entry}: {e}")
+                continue
 
-                write_log("INFO", f"Proxy {proxy} ({scheme}) SUCCESS")
-                return True
-            else:
-                write_log("ERROR", f"Proxy {proxy} ({scheme}) failed: {error}")
-        except Exception as e:
-            write_log("ERROR", f"Error processing proxy {proxy_entry}: {e}")
-            continue
-
-    # If all proxies failed, try direct request
-    if not success:
+    # If proxy first and proxies failed, or direct first and we haven't tried direct yet
+    if CONNECTION_PRIORITY == "proxy":
         write_log("INFO",
                   "All proxies failed, attempting direct request as fallback")
         table_data, error = fetch_table_data_direct(url)
@@ -626,6 +590,7 @@ def check_proxies_and_fetch(url,
         else:
             write_log("ERROR", f"Direct request also failed: {error}")
             return False
+
     return False
 
 
@@ -905,35 +870,63 @@ def subscribe(message):
 
         # Validate station before subscribing
         proxies_data = load_proxies()
+        valid_proxies_available = False
+        if proxies_data and "proxies" in proxies_data and isinstance(proxies_data["proxies"], list) and proxies_data["proxies"]:
+            valid_proxies_available = True
+            
         validation_success = False
         validation_error = None
 
-        # Try with proxies first
-        if proxies_data and "proxies" in proxies_data and proxies_data[
-                "proxies"]:
-            for proxy_entry in proxies_data["proxies"]:
-                try:
-                    if ':' not in proxy_entry:
-                        continue
-                    proxy, scheme = proxy_entry.rsplit(':', 1)
-                    table_data, error = fetch_table_data(url, proxy, scheme)
-
-                    if table_data:
-                        validation_success = True
-                        break
-                    elif error and "Invalid station ID" in error:
-                        validation_error = error
-                        break
-                except:
-                    continue
-
-        # Try direct request if proxies failed
-        if not validation_success and not validation_error:
+        # Try direct first if configured
+        if CONNECTION_PRIORITY == "direct":
             table_data, error = fetch_table_data_direct(url)
             if table_data:
                 validation_success = True
             elif error and "Invalid station ID" in error:
                 validation_error = error
+            elif valid_proxies_available:
+                # Try proxies as fallback
+                for proxy_entry in proxies_data["proxies"]:
+                    try:
+                        if ':' not in proxy_entry:
+                            continue
+                        proxy, scheme = proxy_entry.rsplit(':', 1)
+                        table_data, error = fetch_table_data(url, proxy, scheme)
+                        if table_data:
+                            validation_success = True
+                            break
+                        elif error and "Invalid station ID" in error:
+                            validation_error = error
+                            break
+                    except:
+                        continue
+
+        # Try proxies first if configured
+        elif CONNECTION_PRIORITY == "proxy":
+            if valid_proxies_available:
+                for proxy_entry in proxies_data["proxies"]:
+                    try:
+                        if ':' not in proxy_entry:
+                            continue
+                        proxy, scheme = proxy_entry.rsplit(':', 1)
+                        table_data, error = fetch_table_data(url, proxy, scheme)
+
+                        if table_data:
+                            validation_success = True
+                            break
+                        elif error and "Invalid station ID" in error:
+                            validation_error = error
+                            break
+                    except:
+                        continue
+
+            # Try direct request as fallback
+            if not validation_success and not validation_error:
+                table_data, error = fetch_table_data_direct(url)
+                if table_data:
+                    validation_success = True
+                elif error and "Invalid station ID" in error:
+                    validation_error = error
 
         # Handle validation results
         if validation_error and "Invalid station ID" in validation_error:
@@ -1780,81 +1773,165 @@ async def fetch_multiple_urls_async(urls, proxies):
 # Function to fetch multiple URLs concurrently for a user with multiple subscriptions
 def fetch_multiple_stations_concurrent(chat_id, suffixes):
     proxies_data = load_proxies()
+    valid_proxies_available = False
     
-    # Check if proxies data is valid
-    if not proxies_data or "proxies" not in proxies_data or not isinstance(
-            proxies_data["proxies"], list) or not proxies_data["proxies"]:
-        # Try direct requests as fallback (no retry for direct requests)
-        write_log("INFO", "No valid proxies, attempting direct requests")
-        success_count = 0
+    if proxies_data and "proxies" in proxies_data and isinstance(proxies_data["proxies"], list) and proxies_data["proxies"]:
+        valid_proxies_available = True
+
+    success_count = 0
+    results = {}  # key: suffix, value: (table_data, error)
+
+    if CONNECTION_PRIORITY == "proxy":
+        # Proxy first priority
+        if valid_proxies_available:
+            # Prepare URLs dictionary
+            urls = {suffix: f"{URL_PREFIX}{suffix}" for suffix in suffixes}
+            
+            write_log("INFO", "Trying proxies first for multiple stations (as per CONNECTION_PRIORITY)")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                proxy_results = loop.run_until_complete(
+                    fetch_multiple_urls_async(urls, proxies_data["proxies"]))
+                
+                for suffix, (table_data, result) in proxy_results.items():
+                    results[suffix] = (table_data, result)
+            except Exception as e:
+                write_log("ERROR", f"Error in concurrent multi-station fetch: {e}")
+            finally:
+                loop.close()
         
+        # For any failed stations or no proxies, try direct
+        for suffix in suffixes:
+            table_data = None
+            if suffix in results:
+                table_data = results[suffix][0]
+            
+            if not table_data:
+                url = f"{URL_PREFIX}{suffix}"
+                write_log("INFO", f"Trying direct request for station {suffix} (fallback)")
+                table_data, error = fetch_table_data_direct(url)
+                if table_data:
+                    results[suffix] = (table_data, "direct")
+        
+    elif CONNECTION_PRIORITY == "direct":
+        # Direct first priority
+        write_log("INFO", "Trying direct requests first for multiple stations (as per CONNECTION_PRIORITY)")
         for suffix in suffixes:
             url = f"{URL_PREFIX}{suffix}"
-            # Direct request without retry
-            write_log("INFO", f"Direct request for station {suffix}")
             table_data, error = fetch_table_data_direct(url)
-            
             if table_data:
-                formatted_data = format_table_data(table_data, suffix)
-                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
-                success_count += 1
-                write_log("INFO", f"Direct request SUCCESS for station {suffix}")
+                results[suffix] = (table_data, "direct")
             else:
-                write_log("ERROR", f"Direct request failed for station {suffix}: {error}")
+                results[suffix] = (None, error)
         
-        return success_count > 0
-    
-    # Prepare URLs dictionary
-    urls = {suffix: f"{URL_PREFIX}{suffix}" for suffix in suffixes}
-    
-    # Run the async function to fetch data concurrently
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        results = loop.run_until_complete(
-            fetch_multiple_urls_async(urls, proxies_data["proxies"]))
-        
-        # Process results
-        success_count = 0
-        for suffix, (table_data, result) in results.items():
-            if table_data:
-                # Success with one of the proxies
-                formatted_data = format_table_data(table_data, suffix)
-                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
-                write_log("INFO", f"Proxy {result} SUCCESS for station {suffix} (concurrent)")
-                success_count += 1
-            else:
-                # All proxies failed, try direct request for this URL
-                url = urls[suffix]
-                write_log("INFO", f"All proxies failed for station {suffix}, trying direct request")
-                table_data, error = fetch_table_data_direct(url)
-                
-                if table_data:
-                    formatted_data = format_table_data(table_data, suffix)
-                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
-                    write_log("INFO", f"Direct request SUCCESS for station {suffix} (fallback)")
-                    success_count += 1
-                else:
-                    write_log("ERROR", f"Direct request also failed for station {suffix}: {error}")
-        
-        return success_count > 0
-    except Exception as e:
-        write_log("ERROR", f"Error in concurrent multi-station fetch: {e}")
-        return False
-    finally:
-        loop.close()
+        # For any failed stations, try proxies if available
+        if valid_proxies_available:
+            # Collect failed suffixes
+            failed_suffixes = [s for s, (data, _) in results.items() if not data]
+            if failed_suffixes:
+                urls = {suffix: f"{URL_PREFIX}{suffix}" for suffix in failed_suffixes}
+                write_log("INFO", f"Falling back to proxies for {len(failed_suffixes)} stations")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    proxy_results = loop.run_until_complete(
+                        fetch_multiple_urls_async(urls, proxies_data["proxies"]))
+                    for suffix, (table_data, result) in proxy_results.items():
+                        if table_data:
+                            results[suffix] = (table_data, result)
+                except Exception as e:
+                    write_log("ERROR", f"Error in fallback proxy fetch: {e}")
+                finally:
+                    loop.close()
+
+    # Process all results
+    for suffix, (table_data, result) in results.items():
+        if table_data:
+            formatted_data = format_table_data(table_data, suffix)
+            bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+            write_log("INFO", f"Success for station {suffix} via {result}")
+            success_count += 1
+        else:
+            write_log("ERROR", f"All methods failed for station {suffix}")
+
+    return success_count > 0
 
 # Function to check proxies and fetch data concurrently
 def check_proxies_and_fetch_concurrent(url, chat_id, message_id=None, is_manual=False, suffix=None):
     proxies_data = load_proxies()
+    valid_proxies_available = False
     
-    # Check if proxies data is valid
-    if not proxies_data or "proxies" not in proxies_data or not isinstance(
-            proxies_data["proxies"], list) or not proxies_data["proxies"]:
-        # Try direct request as fallback (no retry for direct requests)
-        write_log("INFO", "No valid proxies, attempting direct request")
-        
-        # Single direct request without retry
+    if proxies_data and "proxies" in proxies_data and isinstance(proxies_data["proxies"], list) and proxies_data["proxies"]:
+        valid_proxies_available = True
+
+    # Send acknowledgment message for manual fetch
+    if is_manual and not message_id:
+        ack_msg = bot.send_message(chat_id,
+                                   "🔄 Fetching latest weather data...")
+        message_id = ack_msg.message_id
+
+    # Check if we should try direct first
+    if CONNECTION_PRIORITY == "direct":
+        write_log("INFO", "Trying direct request first (as per CONNECTION_PRIORITY)")
+        table_data, error = fetch_table_data_direct(url)
+        if table_data:
+            formatted_data = format_table_data(table_data, suffix)
+            if message_id:
+                try:
+                    bot.edit_message_text(formatted_data,
+                                          chat_id,
+                                          message_id,
+                                          parse_mode='HTML')
+                except Exception as e:
+                    bot.send_message(chat_id,
+                                     formatted_data,
+                                     parse_mode='HTML')
+            else:
+                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+            write_log("INFO", "Direct request SUCCESS (first attempt, concurrent)")
+            return True
+        else:
+            write_log("ERROR", f"Direct request failed: {error}")
+            if not valid_proxies_available:
+                return False
+            write_log("INFO", "Falling back to proxies (concurrent)")
+
+    # Try proxies (either first or as fallback)
+    if valid_proxies_available:
+        # Run the async function to fetch data concurrently
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            table_data, result = loop.run_until_complete(
+                fetch_with_proxies_async(url, proxies_data["proxies"]))
+            
+            if table_data:
+                # Success with one of the proxies
+                formatted_data = format_table_data(table_data, suffix)
+                if message_id:
+                    try:
+                        bot.edit_message_text(formatted_data,
+                                              chat_id,
+                                              message_id,
+                                              parse_mode='HTML')
+                    except Exception as e:
+                        bot.send_message(chat_id,
+                                         formatted_data,
+                                         parse_mode='HTML')
+                else:
+                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
+                
+                write_log("INFO", f"Proxy {result} SUCCESS (concurrent)")
+                return True
+        except Exception as e:
+            write_log("ERROR", f"Error in concurrent proxy fetch: {e}")
+        finally:
+            loop.close()
+
+    # If proxy first and proxies failed, or direct first and we haven't tried direct yet
+    if CONNECTION_PRIORITY == "proxy":
+        write_log("INFO", "All proxies failed, attempting direct request as fallback")
         table_data, error = fetch_table_data_direct(url)
         
         if table_data:
@@ -1871,74 +1948,13 @@ def check_proxies_and_fetch_concurrent(url, chat_id, message_id=None, is_manual=
                                      parse_mode='HTML')
             else:
                 bot.send_message(chat_id, formatted_data, parse_mode='HTML')
-            write_log("INFO", "Direct request SUCCESS")
+            write_log("INFO", "Direct request SUCCESS (fallback after concurrent failure)")
             return True
         else:
             write_log("ERROR", f"Direct request failed: {error}")
             return False
-    
-    # Send acknowledgment message for manual fetch
-    if is_manual and not message_id:
-        ack_msg = bot.send_message(chat_id,
-                                   "🔄 Fetching latest weather data...")
-        message_id = ack_msg.message_id
-    
-    # Run the async function to fetch data concurrently
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        table_data, result = loop.run_until_complete(
-            fetch_with_proxies_async(url, proxies_data["proxies"]))
-        
-        if table_data:
-            # Success with one of the proxies
-            formatted_data = format_table_data(table_data, suffix)
-            if message_id:
-                try:
-                    bot.edit_message_text(formatted_data,
-                                          chat_id,
-                                          message_id,
-                                          parse_mode='HTML')
-                except Exception as e:
-                    bot.send_message(chat_id,
-                                     formatted_data,
-                                     parse_mode='HTML')
-            else:
-                bot.send_message(chat_id, formatted_data, parse_mode='HTML')
-            
-            write_log("INFO", f"Proxy {result} SUCCESS (concurrent)")
-            return True
-        else:
-            # All proxies failed, try direct request (no retry for direct requests)
-            write_log("INFO", "All proxies failed concurrently, trying direct request")
-            
-            # Single direct request without retry
-            table_data, error = fetch_table_data_direct(url)
-            
-            if table_data:
-                formatted_data = format_table_data(table_data, suffix)
-                if message_id:
-                    try:
-                        bot.edit_message_text(formatted_data,
-                                              chat_id,
-                                              message_id,
-                                              parse_mode='HTML')
-                    except Exception as e:
-                        bot.send_message(chat_id,
-                                         formatted_data,
-                                         parse_mode='HTML')
-                else:
-                    bot.send_message(chat_id, formatted_data, parse_mode='HTML')
-                write_log("INFO", "Direct request SUCCESS (fallback after concurrent failure)")
-                return True
-            else:
-                write_log("ERROR", f"Direct request failed: {error}")
-                return False
-    except Exception as e:
-        write_log("ERROR", f"Error in concurrent proxy fetch: {e}")
-        return False
-    finally:
-        loop.close()
+
+    return False
 
 # Start the bot with infinite polling and comprehensive error handling
 def start_bot():
