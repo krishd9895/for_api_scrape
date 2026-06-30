@@ -14,12 +14,20 @@ from webserver import keep_alive
 import config
 import logs
 
+# Validate required environment variables first
+required_env_vars = ['BOT_TOKEN', 'MONGO_URI']
+missing_vars = []
+for var in required_env_vars:
+    if not getattr(config, var):
+        missing_vars.append(var)
+if missing_vars:
+    raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
 # Telegram bot
 bot = telebot.TeleBot(config.BOT_TOKEN)
 
-# MongoDB connection
-if not config.MONGO_URI:
-    raise ValueError("MONGO_URI environment variable is required")
+# MongoDB connection (already checked by required_env_vars)
+
 
 # Initialize MongoDB client
 mongo_client = None
