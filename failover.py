@@ -92,22 +92,21 @@ HOSTNAME = socket.gethostname()
 NODE_ALIAS = f"{HOSTNAME}:{PATH_HASH}"
 
 # --- RESILIENT LOGGING ROUTER WITH FALLBACK INJECTION ---
-class NodeAliasFilter(logging.Filter):
-    """Intercepts missing format attributes from third-party metrics logs (Flask, Werkzeug)."""
-    def filter(self, record):
-        if not hasattr(record, "node_alias"):
-            record.node_alias = NODE_ALIAS
-        return True
+# Use LogRecordFactory to ensure every LogRecord has node_alias attribute, regardless of logger
+old_log_record_factory = logging.getLogRecordFactory()
+
+def custom_log_record_factory(*args, **kwargs):
+    record = old_log_record_factory(*args, **kwargs)
+    record.node_alias = NODE_ALIAS
+    return record
+
+logging.setLogRecordFactory(custom_log_record_factory)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [Node: %(node_alias)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-
-# Bind interception filter to the global root logger instance stream
-root_logger = logging.getLogger()
-root_logger.addFilter(NodeAliasFilter())
 
 logger = logging.getLogger("failover_watchdog")
 
