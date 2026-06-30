@@ -21,7 +21,7 @@ TARGET = "main.py"           # PYTHON: "main.py"/"bot.py" | DOCKER_COMPOSE: "-f 
 CUSTOM_RAW_COMMAND = ""      # Used ONLY if LAUNCH_MODE is set to "RAW"
 
 # --- Infrastructure & Distributed Lock Properties ---
-SERVICE_ID = "RF_Bot"   # MANDATORY: Explicit unique cluster lock key
+SERVICE_ID = "RF_Bot"        # MANDATORY: Explicit unique cluster lock key
 DATABASE_NAME = "Failover"
 COLLECTION_NAME = "Services"
 
@@ -53,7 +53,7 @@ from pymongo.errors import PyMongoError, ConnectionFailure, DuplicateKeyError
 from webserver import keep_alive
 
 # ---------------------------------------------------------------------------
-# 1. PERSISTENT GLOBAL MACHINE IDENTITY & MODE VECTOR INTERPRETATION
+# 1. PERSISTENT GLOBAL MACHINE IDENTITY & ADVANCED LOGGING INITIALIZATION
 # ---------------------------------------------------------------------------
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
@@ -91,6 +91,26 @@ PATH_HASH = hashlib.sha1(PROJECT_PATH.encode('utf-8')).hexdigest()[:8]
 HOSTNAME = socket.gethostname()
 NODE_ALIAS = f"{HOSTNAME}:{PATH_HASH}"
 
+# --- RESILIENT LOGGING ROUTER WITH FALLBACK INJECTION ---
+class NodeAliasFilter(logging.Filter):
+    """Intercepts missing format attributes from third-party metrics logs (Flask, Werkzeug)."""
+    def filter(self, record):
+        if not hasattr(record, "node_alias"):
+            record.node_alias = NODE_ALIAS
+        return True
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [Node: %(node_alias)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+# Bind interception filter to the global root logger instance stream
+root_logger = logging.getLogger()
+root_logger.addFilter(NodeAliasFilter())
+
+logger = logging.getLogger("failover_watchdog")
+
 # --- UNIFIED RESOLVED VECTOR INTERPRETATION ---
 final_exec_args = []
 mode_upper = LAUNCH_MODE.strip().upper()
@@ -108,7 +128,6 @@ if mode_upper == "PYTHON":
 elif mode_upper == "DOCKER_COMPOSE":
     DOCKER_BIN = shutil.which("docker") or "docker"
     additional_flags = shlex.split(TARGET)
-    # Global options must stand after the compose command statement block
     final_exec_args = [DOCKER_BIN, "compose"] + additional_flags + ["up"]
 
 elif mode_upper == "RAW":
@@ -128,19 +147,6 @@ else:
 
 CONFIG_PAYLOAD = f"{START_COMMAND_STRING}|{HEARTBEAT_INTERVAL}|{HEARTBEAT_TIMEOUT}"
 CONFIG_FINGERPRINT = hashlib.sha256(CONFIG_PAYLOAD.encode('utf-8')).hexdigest()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [Node: %(node_alias)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-class NodeLoggerAdapter(logging.LoggerAdapter):
-    def process(self, msg, kwargs):
-        kwargs["extra"] = {"node_alias": NODE_ALIAS}
-        return msg, kwargs
-
-logger = NodeLoggerAdapter(logging.getLogger("failover_watchdog"), {})
 
 child_process = None
 is_running = True
@@ -262,7 +268,6 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
     global db_disconnect_tracker
 
     try:
-        # Caching optimization: single read footprint used for the full cycle evaluation
         doc = db_collection.find_one({"_id": SERVICE_ID})
         if not doc:
             return False
@@ -281,8 +286,6 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             return is_owner
 
         # STRICT ATOMIC FILTER CONDITIONAL MATCHER:
-        # If an override points to this machine's explicit alias, bind the filter strictly to that value
-        # to guarantee execution synchronization across rapid database changes.
         if forced_leader:
             if forced_leader != NODE_ALIAS:
                 return False
@@ -322,6 +325,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                 "hostname": HOSTNAME
             })
 
+        # upsert=False completely eliminates QueryFeatureNotAllowed loops inside $expr scopes
         result = db_collection.find_one_and_update(
             filter_query, update_modifier, upsert=False, return_document=pymongo.ReturnDocument.AFTER
         )
@@ -346,7 +350,7 @@ def main():
     print(f"======================================================================", flush=True)
     print(f"🔥 HA PROCESS WATCHDOG ACTIVE | Mode: {LAUNCH_MODE}", flush=True)
     print(f"Service ID : {SERVICE_ID}", flush=True)
-    print(f"NODE ALIAS : {NODE_ALIAS}", flush=True) # Explicit key used for manual overrides
+    print(f"NODE ALIAS : {NODE_ALIAS}", flush=True) 
     print(f"Vector     : {final_exec_args}", flush=True)
     print(f"======================================================================\n", flush=True)
     
@@ -446,7 +450,7 @@ def main():
                             terminate_child()
                             is_leader = False
                     else:
-                        logger.warning("Supervised process dead inside the scheduled pulse window.")
+                        logger.warning("Supervised process died inside the scheduled pulse window.")
 
                 time.sleep(1)
 
@@ -462,6 +466,8 @@ def main():
         release_leadership()
     logger.info("Watchdog cleanup executed cleanly. Shutting down wrapper.")
 
+# Bootstraps your keep-alive background thread metric routes automatically on loading
 keep_alive()
+
 if __name__ == "__main__":
     main()
