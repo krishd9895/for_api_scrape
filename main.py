@@ -5,12 +5,15 @@ import time
 import threading
 import asyncio
 import aiohttp
+import psutil
+import platform
 from requests.exceptions import RequestException, ProxyError, ConnectTimeout
 from datetime import datetime
 from uuid import uuid4
 import re
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+from webserver import keep_alive
 import config
 import logs
 
@@ -695,6 +698,7 @@ def send_help(message):
 
 <b>Owner Commands:</b>
 • <code>/logs</code> - Download bot logs
+• <code>/stats</code> - Show system stats
 • <code>/proxy_list</code> - View all proxies with serial numbers
 • <code>/update_proxy</code> ip:port:protocol - Add a new proxy
 • <code>/delete_proxy</code> serial_number - Remove a proxy
@@ -1091,6 +1095,87 @@ def send_logs(message):
         logs.write_log("ERROR", f"Error in /logs command: {e}")
         try:
             bot.reply_to(message, "❌ Error occurred. Please try again.")
+        except:
+            pass
+
+
+# Command: /stats - Show system stats (owner only)
+@bot.message_handler(commands=['stats'])
+def send_stats(message):
+    try:
+        if str(message.chat.id) != config.OWNER_ID:
+            bot.reply_to(message, "❌ Only the owner can access system stats.")
+            return
+
+        # System info
+        hostname = platform.node()
+        system = platform.system()
+        release = platform.release()
+        machine = platform.machine()
+
+        # CPU stats
+        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_count = psutil.cpu_count()
+
+        # Memory stats
+        mem = psutil.virtual_memory()
+        mem_total = mem.total / (1024 ** 3)
+        mem_used = mem.used / (1024 ** 3)
+        mem_percent = mem.percent
+
+        # Disk stats
+        disk = psutil.disk_usage('/')
+        disk_total = disk.total / (1024 ** 3)
+        disk_used = disk.used / (1024 ** 3)
+        disk_percent = disk.percent
+
+        # Network stats
+        net_io = psutil.net_io_counters()
+        bytes_sent = net_io.bytes_sent / (1024 ** 2)
+        bytes_recv = net_io.bytes_recv / (1024 ** 2)
+
+        # Bot info
+        process = psutil.Process(os.getpid())
+        process_memory = process.memory_info().rss / (1024 ** 2)
+        process_uptime = time.time() - process.create_time()
+        hours, remainder = divmod(process_uptime, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        msg = "📊 <b>System Statistics</b>\n\n"
+        msg += "💻 <b>System Info:</b>\n"
+        msg += f"• Hostname: {hostname}\n"
+        msg += f"• OS: {system} {release}\n"
+        msg += f"• Architecture: {machine}\n\n"
+
+        msg += "⚙️ <b>CPU:</b>\n"
+        msg += f"• Usage: {cpu_percent}%\n"
+        msg += f"• Cores: {cpu_count}\n\n"
+
+        msg += "🧠 <b>Memory:</b>\n"
+        msg += f"• Total: {mem_total:.2f} GB\n"
+        msg += f"• Used: {mem_used:.2f} GB\n"
+        msg += f"• Usage: {mem_percent}%\n\n"
+
+        msg += "💾 <b>Disk:</b>\n"
+        msg += f"• Total: {disk_total:.2f} GB\n"
+        msg += f"• Used: {disk_used:.2f} GB\n"
+        msg += f"• Usage: {disk_percent}%\n\n"
+
+        msg += "🌐 <b>Network:</b>\n"
+        msg += f"• Sent: {bytes_sent:.2f} MB\n"
+        msg += f"• Received: {bytes_recv:.2f} MB\n\n"
+
+        msg += "🤖 <b>Bot Process:</b>\n"
+        msg += f"• Memory: {process_memory:.2f} MB\n"
+        msg += f"• Uptime: {int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+        bot.reply_to(message, msg, parse_mode='HTML')
+        logs.write_log("INFO", "Owner requested system stats")
+
+    except Exception as e:
+        logs.write_log("ERROR", f"Error in /stats command: {e}")
+        try:
+            bot.reply_to(message, "❌ Error occurred while fetching stats.")
         except:
             pass
 
@@ -1924,7 +2009,7 @@ def start_bot():
             time.sleep(5)  # Wait before restarting
             continue
 
-
+keep_alive()
 # Start the bot
 if __name__ == "__main__":
     try:
