@@ -9,12 +9,18 @@
 # MONGODB DOCUMENT STRUCTURE:
 # {
 #   "_id": "RF_Bot",
+#   "watchdog_version": "1.1.0",
 #   "current_leader": {
 #     "node_id": "uuid:/app",
 #     "node_alias": "hostname:hash",
 #     "status": "active", // "active" or "offline"
 #     "last_heartbeat": ISODate("..."),
-#     "hostname": "..."
+#     "hostname": "...",
+#     "pid": 1234,
+#     "started_at": ISODate("..."),
+#     "heartbeat_count": 100,
+#     "os": "Windows 11",
+#     "python_version": "3.13.5"
 #   },
 #   "forced_leader": {
 #     "node_alias": "hostname:hash" // or null
@@ -24,9 +30,28 @@
 #       "node_id": "uuid:/app",
 #       "node_alias": "hostname:hash",
 #       "hostname": "...",
-#       "last_heartbeat": ISODate("...")
+#       "last_heartbeat": ISODate("..."),
+#       "os": "Windows 11",
+#       "python_version": "3.13.5"
 #     }
 #   ],
+#   "leader_history": [
+#     {
+#       "node_alias": "hostname:hash",
+#       "started_at": ISODate("..."),
+#       "ended_at": ISODate("...")
+#     }
+#   ],
+#   "last_crash": {
+#     "exit_code": 1,
+#     "timestamp": ISODate("..."),
+#     "node_alias": "hostname:hash"
+#   },
+#   "statistics": {
+#     "leader_changes": 1,
+#     "bot_restarts": 0,
+#     "forced_takeovers": 0
+#   },
 #   "config_fingerprint": "..."
 # }
 #
@@ -36,6 +61,9 @@
 # - Graceful shutdown: Handles SIGINT/SIGTERM properly
 # - Automatic restart: If the application crashes, it restarts it up to LOCAL_RETRY_LIMIT times
 # - Standby node tracking: All standby nodes send heartbeats and are tracked in MongoDB
+# - Leadership history: Tracks last 20 leadership changes
+# - Cluster statistics: Tracks leader changes, bot restarts, forced takeovers
+# - Last crash info: Tracks last time the bot crashed
 #
 # INSTRUCTIONS:
 # 1. Provide your 'MONGO_URI' inside your local .env file (Mandatory).
@@ -95,6 +123,12 @@ STARTUP_GRACE_PERIOD = 5
 # Maximum time (in seconds) to tolerate DB disconnections before stepping down
 MAX_NETWORK_GRACE_S = 30
 
+# Maximum number of leadership history entries to keep
+MAX_LEADER_HISTORY = 20
+
+# --- WATCHDOG VERSION ---
+WATCHDOG_VERSION = "1.1.0"
+
 # --- STANDARD IMPORTS ---
 import os
 import sys
@@ -131,6 +165,10 @@ IS_WINDOWS = platform.system() == "Windows"
 if not SERVICE_ID.strip() or not MONGO_URI or not MONGO_URI.strip():
     print("CRITICAL CONFIGURATION ERROR: Missing core environment variables or SERVICE_ID!", file=sys.stderr)
     sys.exit(1)
+
+# Get OS and Python version info
+OS_INFO = f"{platform.system()} {platform.release()}"
+PYTHON_VERSION = platform.python_version()
 
 # Get project root directory
 PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -233,6 +271,15 @@ CONFIG_FINGERPRINT = hashlib.sha256(CONFIG_PAYLOAD.encode('utf-8')).hexdigest()
 child_process = None          # Handle to the running application process
 is_running = True             # Should the main loop keep running?
 db_disconnect_tracker = None  # When did we last lose DB connection?
+startup_delay = random.uniform(0.5, 3.5)
+watchdog_started_at = datetime.now(timezone.utc)
+heartbeat_counter = 0         # Counter for heartbeats sent by this node
+last_logged_status = {        # To avoid duplicate logging
+    "leader": None,
+    "forced_leader": None,
+    "standby_count": None,
+    "status": None
+}
 
 # --- MONGODB CLIENT INITIALIZATION ---
 try:
@@ -410,7 +457,9 @@ def update_standby_node_heartbeat():
                     "node_id": NODE_ID,
                     "node_alias": NODE_ALIAS,
                     "hostname": HOSTNAME,
-                    "last_heartbeat": current_time
+                    "last_heartbeat": current_time,
+                    "os": OS_INFO,
+                    "python_version": PYTHON_VERSION
                 }
                 node_found = True
                 break
@@ -420,7 +469,9 @@ def update_standby_node_heartbeat():
                 "node_id": NODE_ID,
                 "node_alias": NODE_ALIAS,
                 "hostname": HOSTNAME,
-                "last_heartbeat": current_time
+                "last_heartbeat": current_time,
+                "os": OS_INFO,
+                "python_version": PYTHON_VERSION
             })
 
         # Update MongoDB
@@ -458,6 +509,7 @@ def bootstrap_and_validate_lock():
     1. Creates the initial cluster control document in MongoDB if it doesn't exist
     2. Normalizes forced_leader (treats empty string as None)
     3. Validates that all nodes are running the same configuration
+    4. Initializes statistics and leader history arrays
     """
     try:
         doc = db_collection.find_one({"_id": SERVICE_ID})
@@ -466,17 +518,30 @@ def bootstrap_and_validate_lock():
             # Document doesn't exist yet - create it with default values
             initial_state = {
                 "_id": SERVICE_ID,
+                "watchdog_version": WATCHDOG_VERSION,
                 "current_leader": {
                     "node_id": None,
                     "node_alias": None,
                     "status": "offline",
                     "last_heartbeat": datetime.fromtimestamp(0, tz=timezone.utc),
-                    "hostname": None
+                    "hostname": None,
+                    "pid": None,
+                    "started_at": None,
+                    "heartbeat_count": 0,
+                    "os": None,
+                    "python_version": None
                 },
                 "forced_leader": {
                     "node_alias": None
                 },
                 "standby_nodes": [],
+                "leader_history": [],
+                "last_crash": None,
+                "statistics": {
+                    "leader_changes": 0,
+                    "bot_restarts": 0,
+                    "forced_takeovers": 0
+                },
                 "config_fingerprint": CONFIG_FINGERPRINT
             }
             try:
@@ -496,12 +561,25 @@ def bootstrap_and_validate_lock():
                     {"$set": {"forced_leader.node_alias": None}}
                 )
 
-            # Ensure standby_nodes exists
+            # Ensure all required fields exist
+            updates = {}
             if "standby_nodes" not in doc:
-                db_collection.update_one(
-                    {"_id": SERVICE_ID},
-                    {"$set": {"standby_nodes": []}}
-                )
+                updates["standby_nodes"] = []
+            if "leader_history" not in doc:
+                updates["leader_history"] = []
+            if "last_crash" not in doc:
+                updates["last_crash"] = None
+            if "statistics" not in doc:
+                updates["statistics"] = {
+                    "leader_changes": 0,
+                    "bot_restarts": 0,
+                    "forced_takeovers": 0
+                }
+            if "watchdog_version" not in doc:
+                updates["watchdog_version"] = WATCHDOG_VERSION
+
+            if updates:
+                db_collection.update_one({"_id": SERVICE_ID}, {"$set": updates})
 
         # Verify that all nodes are running the same configuration
         if doc and doc.get("config_fingerprint") != CONFIG_FINGERPRINT:
@@ -515,17 +593,48 @@ def bootstrap_and_validate_lock():
         time.sleep(5)
         return False
 
-def release_leadership():
+def release_leadership(doc=None):
     """
-    Voluntarily step down as leader - but don't clear current_leader fields
-    unless we're the current owner
+    Voluntarily step down as leader - update leader history and set status to offline
     """
+    global heartbeat_counter
     try:
+        current_time = datetime.now(timezone.utc)
         query = {"_id": SERVICE_ID, "current_leader.node_id": NODE_ID}
-        # Only update if we're still the leader
-        result = db_collection.find_one(query)
-        if result:
+        
+        if not doc:
+            doc = db_collection.find_one(query)
+        
+        if doc:
             logger.info(f"[LEADER STATUS] Stepping down as leader - was previously active node")
+            
+            # Update leader history
+            leader_history = doc.get("leader_history", [])
+            current_leader = doc.get("current_leader", {})
+            started_at = current_leader.get("started_at")
+            
+            if started_at:
+                # Append to leader history
+                leader_history.append({
+                    "node_alias": current_leader.get("node_alias"),
+                    "started_at": started_at,
+                    "ended_at": current_time
+                })
+                
+                # Keep only last MAX_LEADER_HISTORY entries
+                if len(leader_history) > MAX_LEADER_HISTORY:
+                    leader_history = leader_history[-MAX_LEADER_HISTORY:]
+            
+            # Update MongoDB
+            update = {
+                "$set": {
+                    "current_leader.status": "offline",
+                    "leader_history": leader_history
+                }
+            }
+            db_collection.update_one(query, update)
+        
+        heartbeat_counter = 0
         logger.info("Released leadership lock successfully.")
     except Exception as e:
         logger.error(f"Failed to issue clean leadership release: {e}")
@@ -541,7 +650,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
     Returns:
         True if we are the current leader, False otherwise
     """
-    global db_disconnect_tracker
+    global db_disconnect_tracker, heartbeat_counter
 
     try:
         doc = db_collection.find_one({"_id": SERVICE_ID})
@@ -560,12 +669,24 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
 
         # Get number of standby nodes for logging
         standby_nodes_count = len(doc.get("standby_nodes", []))
-
-        # Log detailed status
-        logger.info(f"[LEADER STATUS] Forced leader: '{forced_leader}', This node is forced leader: {this_node_is_forced_leader}")
-        logger.info(f"[LEADER STATUS] Current leader: '{current_leader_node_alias}', Active: {is_current_leader_active}")
-        logger.info(f"[LEADER STATUS] Standby nodes: {standby_nodes_count}")
-        logger.info(f"[LEADER STATUS] This node: '{NODE_ALIAS}'")
+        
+        # Log only if status changed
+        status_changed = False
+        if last_logged_status["leader"] != current_leader_node_alias:
+            last_logged_status["leader"] = current_leader_node_alias
+            status_changed = True
+        if last_logged_status["forced_leader"] != forced_leader:
+            last_logged_status["forced_leader"] = forced_leader
+            status_changed = True
+        if last_logged_status["standby_count"] != standby_nodes_count:
+            last_logged_status["standby_count"] = standby_nodes_count
+            status_changed = True
+        
+        if status_changed:
+            logger.info(f"[LEADER STATUS] Forced leader: '{forced_leader}', This node is forced leader: {this_node_is_forced_leader}")
+            logger.info(f"[LEADER STATUS] Current leader: '{current_leader_node_alias}', Active: {is_current_leader_active}")
+            logger.info(f"[LEADER STATUS] Standby nodes: {standby_nodes_count}")
+            logger.info(f"[LEADER STATUS] This node: '{NODE_ALIAS}'")
 
         if force_check_only:
             # We are already leader - just check if we should stay leader
@@ -582,27 +703,69 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             return False
 
         # --- NOT FORCE CHECK ONLY: TRY TO ACQUIRE OR MAINTAIN LEADERSHIP ---
-
+        current_time = datetime.now(timezone.utc)
+        
         if this_node_is_forced_leader:
             # THIS NODE IS THE FORCED LEADER: take over UNCONDITIONALLY!
             previous_leader_alias = current_leader_node_alias
-            logger.info(f"[LEADER STATUS] This is the forced leader! Attempting to take over leadership...")
-            takeover_reason = "This node is the configured forced leader"
-            if previous_leader_alias and previous_leader_alias != NODE_ALIAS:
-                logger.warning(f"[LEADER STATUS] Taking over from previous leader: {previous_leader_alias}")
-
+            was_this_node_leader_before = is_this_node_current_leader
+            
+            if not was_this_node_leader_before:
+                logger.info(f"[LEADER STATUS] This is the forced leader! Attempting to take over leadership...")
+                if previous_leader_alias and previous_leader_alias != NODE_ALIAS:
+                    logger.warning(f"[LEADER STATUS] Taking over from previous leader: {previous_leader_alias}")
+            
+            # Update leader history if previous leader is different
+            leader_history = doc.get("leader_history", [])
+            if not was_this_node_leader_before and current_leader_node_alias:
+                # Add previous leader to history
+                leader_history.append({
+                    "node_alias": current_leader_node_alias,
+                    "started_at": current_leader.get("started_at"),
+                    "ended_at": current_time
+                })
+                # Keep only last MAX_LEADER_HISTORY entries
+                if len(leader_history) > MAX_LEADER_HISTORY:
+                    leader_history = leader_history[-MAX_LEADER_HISTORY:]
+            
+            # Increment heartbeat counter
+            if is_this_node_current_leader:
+                heartbeat_counter += 1
+            else:
+                heartbeat_counter = 1
+            
+            # Get stats
+            stats = doc.get("statistics", {"leader_changes": 0, "bot_restarts": 0, "forced_takeovers": 0})
+            if not was_this_node_leader_before:
+                stats["leader_changes"] += 1
+                stats["forced_takeovers"] += 1
+            
             update_modifier = {
                 "$set": {
                     "current_leader.node_id": NODE_ID,
                     "current_leader.node_alias": NODE_ALIAS,
                     "current_leader.status": "active",
                     "current_leader.hostname": HOSTNAME,
+                    "current_leader.os": OS_INFO,
+                    "current_leader.python_version": PYTHON_VERSION,
+                    "current_leader.heartbeat_count": heartbeat_counter,
+                    "leader_history": leader_history,
+                    "statistics": stats,
+                    "watchdog_version": WATCHDOG_VERSION,
                     "config_fingerprint": CONFIG_FINGERPRINT
                 },
                 "$currentDate": {
                     "current_leader.last_heartbeat": True
                 }
             }
+            
+            # Set started_at only if we're not already leader
+            if not was_this_node_leader_before:
+                update_modifier["$set"]["current_leader.started_at"] = current_time
+            
+            # Set PID if child process exists
+            if child_process and child_process.poll() is None:
+                update_modifier["$set"]["current_leader.pid"] = child_process.pid
 
             result = db_collection.find_one_and_update(
                 {"_id": SERVICE_ID},  # Match the document no matter what
@@ -613,11 +776,11 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
 
             became_leader = result and result.get("current_leader", {}).get("node_id") == NODE_ID
             if became_leader and not is_this_node_current_leader:
-                takeover_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                takeover_time = current_time.strftime("%Y-%m-%d %H:%M:%S UTC")
                 logger.info(f"🎉 [TAKEOVER COMPLETE!] Took over as leader at {takeover_time}")
                 logger.info(f"📋 [TAKEOVER DETAILS]:")
                 logger.info(f"   • Previous leader: {previous_leader_alias if previous_leader_alias else 'No previous leader'}")
-                logger.info(f"   • Reason: {takeover_reason}")
+                logger.info(f"   • Reason: This node is the configured forced leader")
 
             db_disconnect_tracker = None
             return became_leader
@@ -626,10 +789,14 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
         if forced_leader:
             is_fl_active = is_forced_leader_currently_active(doc, forced_leader)
             if is_fl_active:
-                logger.info(f"[LEADER STATUS] Waiting for forced leader '{forced_leader}' - it's currently active")
+                if last_logged_status["status"] != "waiting_for_fl":
+                    logger.info(f"[LEADER STATUS] Waiting for forced leader '{forced_leader}' - it's currently active")
+                    last_logged_status["status"] = "waiting_for_fl"
                 return False
             else:
-                logger.warning(f"[LEADER STATUS] Forced leader '{forced_leader}' is offline! Any node can take over!")
+                if last_logged_status["status"] != "fl_offline":
+                    logger.warning(f"[LEADER STATUS] Forced leader '{forced_leader}' is offline! Any node can take over!")
+                    last_logged_status["status"] = "fl_offline"
 
         # Now handle cases where we might take over (either no forced leader or forced leader is offline)
         # Determine if we should attempt takeover
@@ -678,8 +845,34 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
 
         if should_attempt_takeover:
             previous_leader_alias = current_leader_node_alias
-            if not is_this_node_current_leader:
+            was_this_node_leader_before = is_this_node_current_leader
+            
+            if not was_this_node_leader_before:
                 logger.warning(f"[LEADER STATUS] Previous leader {previous_leader_alias if previous_leader_alias else 'No leader'} - taking over")
+            
+            # Update leader history if previous leader is different
+            leader_history = doc.get("leader_history", [])
+            if not was_this_node_leader_before and current_leader_node_alias:
+                # Add previous leader to history
+                leader_history.append({
+                    "node_alias": current_leader_node_alias,
+                    "started_at": current_leader.get("started_at"),
+                    "ended_at": current_time
+                })
+                # Keep only last MAX_LEADER_HISTORY entries
+                if len(leader_history) > MAX_LEADER_HISTORY:
+                    leader_history = leader_history[-MAX_LEADER_HISTORY:]
+            
+            # Increment heartbeat counter
+            if is_this_node_current_leader:
+                heartbeat_counter += 1
+            else:
+                heartbeat_counter = 1
+            
+            # Get stats
+            stats = doc.get("statistics", {"leader_changes": 0, "bot_restarts": 0, "forced_takeovers": 0})
+            if not was_this_node_leader_before:
+                stats["leader_changes"] += 1
 
             filter_query = {
                 "_id": SERVICE_ID,
@@ -701,12 +894,26 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
                     "current_leader.node_alias": NODE_ALIAS,
                     "current_leader.status": "active",
                     "current_leader.hostname": HOSTNAME,
+                    "current_leader.os": OS_INFO,
+                    "current_leader.python_version": PYTHON_VERSION,
+                    "current_leader.heartbeat_count": heartbeat_counter,
+                    "leader_history": leader_history,
+                    "statistics": stats,
+                    "watchdog_version": WATCHDOG_VERSION,
                     "config_fingerprint": CONFIG_FINGERPRINT
                 },
                 "$currentDate": {
                     "current_leader.last_heartbeat": True
                 }
             }
+            
+            # Set started_at only if we're not already leader
+            if not was_this_node_leader_before:
+                update_modifier["$set"]["current_leader.started_at"] = current_time
+            
+            # Set PID if child process exists
+            if child_process and child_process.poll() is None:
+                update_modifier["$set"]["current_leader.pid"] = child_process.pid
 
             result = db_collection.find_one_and_update(
                 filter_query,
@@ -717,7 +924,7 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
 
             became_leader = result and result.get("current_leader", {}).get("node_id") == NODE_ID
             if became_leader and not is_this_node_current_leader:
-                takeover_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                takeover_time = current_time.strftime("%Y-%m-%d %H:%M:%S UTC")
                 logger.info(f"🎉 [TAKEOVER COMPLETE!] Took over as leader at {takeover_time}")
                 logger.info(f"📋 [TAKEOVER DETAILS]:")
                 logger.info(f"   • Previous leader: {previous_leader_alias if previous_leader_alias else 'No previous leader'}")
@@ -754,10 +961,12 @@ def main():
     print(f"Service ID : {SERVICE_ID}", flush=True)
     print(f"NODE ALIAS : {NODE_ALIAS}", flush=True)
     print(f"Vector     : {final_exec_args}", flush=True)
+    print(f"Version    : {WATCHDOG_VERSION}", flush=True)
     print(f"======================================================================\n", flush=True)
 
     # Wait a random short time (avoids thundering herd on startup)
-    time.sleep(random.uniform(0.5, 3.5))
+    logger.info(f"[STARTUP] Waiting {startup_delay:.2f}s before starting (randomized startup delay)")
+    time.sleep(startup_delay)
 
     # Set up database and bootstrap
     if not setup_database_indexes() or not bootstrap_and_validate_lock():
@@ -774,7 +983,9 @@ def main():
         try:
             # --- STANDBY MONITORING LAYER ---
             if not is_leader:
-                logger.info(f"[STATUS] This node is standby, checking for leadership...")
+                if last_logged_status["status"] != "standby":
+                    logger.info(f"[STATUS] This node is standby, checking for leadership...")
+                    last_logged_status["status"] = "standby"
 
                 # Update standby heartbeat if needed
                 current_time = time.time()
@@ -807,6 +1018,28 @@ def main():
                         exit_code = child_process.poll()
                         local_failures += 1
                         logger.warning(f"[BOT STATUS] Bot process crashed (Exit code: {exit_code}). Failures: {local_failures}/{LOCAL_RETRY_LIMIT}")
+                        
+                        # Update last crash info in MongoDB
+                        try:
+                            current_time = datetime.now(timezone.utc)
+                            stats = db_collection.find_one({"_id": SERVICE_ID}, {"statistics": 1})
+                            if stats:
+                                stats = stats.get("statistics", {"leader_changes": 0, "bot_restarts": 0, "forced_takeovers": 0})
+                                stats["bot_restarts"] += 1
+                                db_collection.update_one(
+                                    {"_id": SERVICE_ID},
+                                    {"$set": {
+                                        "last_crash": {
+                                            "exit_code": exit_code,
+                                            "timestamp": current_time,
+                                            "node_alias": NODE_ALIAS
+                                        },
+                                        "statistics": stats
+                                    }}
+                                )
+                        except Exception as e:
+                            logger.error(f"Failed to update last crash info: {e}")
+                        
                         child_process = None
 
                         # If we've failed too many times, give up and step down
@@ -815,6 +1048,7 @@ def main():
                             terminate_child()
                             release_leadership()
                             is_leader = False
+                            last_logged_status["status"] = None
                             time.sleep(CHECK_INTERVAL)
                             continue
 
@@ -822,6 +1056,7 @@ def main():
                     if not try_acquire_or_maintain_leadership():
                         logger.warning(f"[LEADER STATUS] Split-brain caught during crash recovery phase. Reverting to standby.")
                         is_leader = False
+                        last_logged_status["status"] = None
                         continue
 
                     # Start the application!
@@ -840,6 +1075,15 @@ def main():
                             logger.error(f"[BOT STATUS] Bot process died during startup grace window.")
                             continue
 
+                        # Update MongoDB with PID
+                        try:
+                            db_collection.update_one(
+                                {"_id": SERVICE_ID, "current_leader.node_id": NODE_ID},
+                                {"$set": {"current_leader.pid": child_process.pid}}
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to update PID in MongoDB: {e}")
+
                         # Verify we still have leadership after startup
                         if try_acquire_or_maintain_leadership():
                             last_heartbeat_time = time.time()
@@ -848,6 +1092,7 @@ def main():
                             logger.critical(f"[LEADER STATUS] Failed to retain lock during verification. Stopping bot.")
                             terminate_child()
                             is_leader = False
+                            last_logged_status["status"] = None
                             continue
                     except Exception as e:
                         logger.error(f"[BOT STATUS] System failure attempting to start bot: {e}")
@@ -864,13 +1109,14 @@ def main():
                     terminate_child()
                     release_leadership()
                     is_leader = False
+                    last_logged_status["status"] = None
                     continue
 
                 # Send heartbeat if it's time
                 if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL:
                     if child_process.poll() is None:
                         if try_acquire_or_maintain_leadership(update_telemetry=False):
-                            logger.info(f"[HEARTBEAT] Heartbeat logged successfully.")
+                            logger.debug(f"[HEARTBEAT] Heartbeat logged successfully (Count: {heartbeat_counter})")
                             last_heartbeat_time = current_time
                             local_failures = 0
                         else:
@@ -878,6 +1124,7 @@ def main():
                             terminate_child()
                             release_leadership()
                             is_leader = False
+                            last_logged_status["status"] = None
                     else:
                         logger.warning(f"[BOT STATUS] Bot process died inside scheduled pulse window.")
 
