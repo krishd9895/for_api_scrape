@@ -5,3 +5,4 @@ Flask
 PySocks
 pymongo
 aiohttp
+python-dotenv
