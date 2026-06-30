@@ -259,10 +259,32 @@ def release_leadership():
     except Exception as e:
         logger.error(f"Failed to issue clean leadership release: {e}")
 
+def is_forced_leader_active(doc):
+    """Check if forced leader is active (has a recent heartbeat or is current owner)."""
+    forced_leader = doc.get("forced_leader_node")
+    if not forced_leader:
+        return False
+    
+    last_heartbeat = doc.get("last_heartbeat")
+    owner_node_id = doc.get("owner_node_id")
+    doc_node_alias = doc.get("node_alias")
+    
+    # If document's node_alias is forced_leader and status is active, it's active
+    if doc_node_alias == forced_leader and doc.get("status") == "active":
+        return True
+    
+    # If last heartbeat is within HEARTBEAT_TIMEOUT, consider active
+    if owner_node_id and last_heartbeat:
+        time_since_heartbeat = (datetime.now(timezone.utc) - last_heartbeat).total_seconds()
+        if time_since_heartbeat < HEARTBEAT_TIMEOUT:
+            return True
+    
+    return False
+
 def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=False):
     """
     Acquires or maintains leadership using remote server time filters.
-    Respects administrative 'forced_leader_node' aliases atomically.
+    Respects administrative 'forced_leader_node' aliases atomically, but allows takeover if forced leader is offline.
     """
     global db_disconnect_tracker
 
@@ -277,19 +299,24 @@ def try_acquire_or_maintain_leadership(force_check_only=False, update_telemetry=
             db_disconnect_tracker = None 
             is_owner = (doc.get("owner_node_id") == NODE_ID)
             
-            # If an administrative override targets another machine alias, step down immediately
-            if is_owner and forced_leader and forced_leader != NODE_ALIAS:
-                logger.warning(f"Administrative override active! Leadership forced to node: '{forced_leader}'. Stepping down.")
-                return False
-                
+            if is_owner and forced_leader:
+                if is_forced_leader_active(doc) and forced_leader != NODE_ALIAS:
+                    logger.warning(f"Administrative override active! Forced leader '{forced_leader}' is back online. Stepping down.")
+                    return False
+            
             return is_owner
 
+        # Determine if forced leader is active
+        forced_leader_active = is_forced_leader_active(doc)
+        
         # STRICT ATOMIC FILTER CONDITIONAL MATCHER:
-        if forced_leader:
+        if forced_leader and forced_leader_active:
+            # Only let forced leader take over if it's active
             if forced_leader != NODE_ALIAS:
                 return False
             filter_query = {"_id": SERVICE_ID, "forced_leader_node": NODE_ALIAS}
         else:
+            # Either no forced leader, or forced leader is offline - let anyone take over
             filter_query = {
                 "_id": SERVICE_ID,
                 "$expr": {
